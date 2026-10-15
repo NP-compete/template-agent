@@ -97,6 +97,12 @@ harness_profiles:
     excluded_middleware: []
     general_purpose_subagent:
       enabled: true
+  gemini-3-flash-preview:
+    system_prompt_suffix: ""
+    excluded_tools: []
+    excluded_middleware: []
+    general_purpose_subagent:
+      enabled: true
   claude-sonnet-4:
     system_prompt_suffix: ""
     excluded_tools: []
