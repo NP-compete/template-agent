@@ -26,9 +26,14 @@ strategy: first_message
 
 # Cheapest first — order is load-bearing. The classifier is told to pick
 # the first tier that can plausibly do the job.
+#
+# NOTE: all three tiers currently name the same model, so enabling the
+# router would buy nothing and cost a classifier call per turn. Give
+# `fast` a cheaper model before setting `enabled: true`, or leave it
+# off — which is what it is.
 tiers:
   - name: fast
-    model: gemini-3.5-flash-lite
+    model: gemini-3.8-flash
     criteria: >
       Short factual questions, lookups, formatting, summarising text that
       is already supplied, and single-tool calls with an obvious argument.
@@ -52,5 +57,5 @@ fallback_tier: deep
 
 # Must be cheap and fast — its cost is charged against the savings.
 # Leave empty to use rules only, with no classifier call at all.
-classifier_model: gemini-3.5-flash-lite
+classifier_model: gemini-3.8-flash
 classifier_timeout: 10.0

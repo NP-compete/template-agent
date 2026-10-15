@@ -5,7 +5,7 @@ description: >
   Investigates production incidents and reviews code changes. Correlates
   Datadog observability signals with GitLab history. Use for alerts,
   outages, "why is X slow", merge request review, and pipeline failures.
-model: gemini-3.5-flash
+model: gemini-3.8-flash
 mcps:
   - datadog
   - gitlab

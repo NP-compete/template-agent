@@ -6,7 +6,7 @@ description: >
   lineage, freshness and classification, across the Atlan catalogue and
   Dataverse data products. Use for "where is the data for X", "who owns
   this", and impact analysis before a schema change.
-model: gemini-3.5-flash-lite
+model: gemini-3.8-flash
 mcps:
   - atlan
   - dataverse
