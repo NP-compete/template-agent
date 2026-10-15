@@ -1,0 +1,44 @@
+# Config on a volume rather than in the image or a ConfigMap.
+#
+# The image was the previous answer for Kind (Containerfile.config
+# layered config/agent in), and it makes a rebuild the only way to
+# change a prompt. A ConfigMap was the answer for the UI, and it is
+# read-only in the pod and rewritten by the next `apply -k`, so an
+# edit made against a running cluster does not survive a deploy.
+#
+# A volume is writable, survives both, and is the same mechanism
+# preprod and prod already assume the operator provides.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-config-pvc
+  labels:
+    app: template-agent
+    component: config
+spec:
+  # RWO: the agent reads this, and on Kind every replica lands on the
+  # one node. Several nodes reading the same config need RWX, which on
+  # OpenShift is usually not the default storage class — a conscious
+  # change rather than a number bump.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Prompts, skills, subagents and a handful of YAML. The whole of
+      # config/agent is well under a megabyte; 64Mi is the smallest
+      # request that does not look like a typo.
+      storage: 64Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ui-config-pvc
+  labels:
+    app: template-agent
+    component: config
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 16Mi

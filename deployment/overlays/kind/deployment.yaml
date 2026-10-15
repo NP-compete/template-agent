@@ -20,6 +20,27 @@ spec:
         app: agent
         component: agent
     spec:
+      initContainers:
+        # The agent exits if PROMPT.md is missing, and an empty volume
+        # is exactly what a fresh cluster has. Without this the pod
+        # CrashLoopBackOffs until someone seeds it, which reads as a
+        # broken image rather than as "no config yet".
+        - name: wait-for-config
+          image: agent:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until [ -f /app/config/agent/PROMPT.md ]; do
+                echo "waiting for config on the volume — seed it with: make kind-seed-config"
+                sleep 3
+              done
+              echo "config present"
+          volumeMounts:
+            - name: agent-config-volume
+              mountPath: /app/config/agent
+              readOnly: true
       containers:
         - name: agent
           image: agent:local
@@ -198,6 +219,12 @@ spec:
               memory: "2Gi"
               cpu: "500m"
           volumeMounts:
+            # Config, read from the volume rather than from the image.
+            # CONFIG_PATH in the base ConfigMap already points here;
+            # what changes is who supplies it.
+            - name: agent-config-volume
+              mountPath: /app/config/agent
+              readOnly: true
             # Documents, exposed to the agent at /documents/. readOnly
             # at the mount as well as in the backend and the
             # permission rules: three independent places, because a
@@ -210,6 +237,9 @@ spec:
             - name: agent-documents
               mountPath: /app/data/documents
       volumes:
+        - name: agent-config-volume
+          persistentVolumeClaim:
+            claimName: agent-config-pvc
         - name: agent-documents
           persistentVolumeClaim:
             claimName: agent-documents-pvc

@@ -20,6 +20,7 @@ components:
   # scaleToZero: disabled in values.yaml
   # externalChannels: disabled in values.yaml
   - ../../components/documents-pvc
+  - ../../components/config-pvc
 
 patches:
   - path: generated.yaml
@@ -31,11 +32,11 @@ labels:
       app: template-agent
 
 images:
-  # The config-bearing derived image (Containerfile.config), not the bare
-  # agent image — Kind has no config mount and the agent will not start
-  # without one.
+  # The bare agent image. Config arrives on a volume now, so there is
+  # no derived image to keep in step and no rebuild to change a
+  # prompt — see components/config-pvc.
   - name: agent
-    newName: localhost/template-agent-config
+    newName: localhost/template-agent
     newTag: local
   - name: template-ui
     newName: localhost/template-ui

@@ -244,6 +244,9 @@ mpp:
 KIND_CLUSTER := template-agent
 KIND_CTX := kind-$(KIND_CLUSTER)
 KIND_IMAGE := template-agent:local
+# Only for clusters with no config volume. Kind mounts one now, so
+# `make kind` does not build this — Containerfile.config is kept for
+# anywhere that cannot provide a volume.
 KIND_AGENT_CONFIG_IMAGE := template-agent-config:local
 KIND_MCP_IMAGE := template-mcp-server:local
 KIND_UI_IMAGE := template-ui:local
@@ -257,6 +260,12 @@ KIND_MCP_REPO := https://github.com/redhat-data-and-ai/template-mcp-server.git
 KIND_MCP_BRANCH ?= main
 KIND_UI_REPO := https://github.com/redhat-data-and-ai/template-ui.git
 KIND_UI_BRANCH ?= main
+
+# Build the UI from a sibling checkout when there is one, so `make
+# kind` deploys the tree you are editing rather than whatever is on
+# the remote's default branch. Falls back to the clone for anyone
+# working on the agent alone. Override with KIND_UI_DIR=...
+KIND_UI_DIR ?= $(if $(wildcard ../template-ui/Containerfile),../template-ui,$(KIND_DIR)/template-ui)
 KCTL := kubectl --context $(KIND_CTX)
 
 kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
@@ -274,7 +283,7 @@ kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
 	else \
 		echo "MCP server already cloned"; \
 	fi
-	@if [ ! -d "$(KIND_DIR)/template-ui" ]; then \
+	@if [ "$(KIND_UI_DIR)" != "../template-ui" ] && [ ! -d "$(KIND_DIR)/template-ui" ]; then \
 		echo "Cloning template-ui (branch: $(KIND_UI_BRANCH))..."; \
 		mkdir -p $(KIND_DIR); \
 		git clone --branch $(KIND_UI_BRANCH) --depth 1 $(KIND_UI_REPO) $(KIND_DIR)/template-ui; \
@@ -296,14 +305,12 @@ kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
 	@# --- Step 3: Build and load images ---
 	@echo "Building agent image..."
 	@podman build -t $(KIND_IMAGE) .
-	@echo "Layering config/agent onto the agent image (Kind has no config mount)..."
-	@podman build -t $(KIND_AGENT_CONFIG_IMAGE) --build-arg BASE=$(KIND_IMAGE) -f Containerfile.config .
 	@echo "Building MCP server image..."
 	@podman build -t $(KIND_MCP_IMAGE) -f $(KIND_DIR)/template-mcp-server/Containerfile $(KIND_DIR)/template-mcp-server
-	@echo "Building UI image..."
-	@podman build -t $(KIND_UI_IMAGE) $(KIND_DIR)/template-ui
+	@echo "Building UI image from $(KIND_UI_DIR)..."
+	@podman build -t $(KIND_UI_IMAGE) $(KIND_UI_DIR)
 	@echo "Loading images into Kind (podman -> archive -> kind)..."
-	@podman save $(KIND_AGENT_CONFIG_IMAGE) -o /tmp/kind-agent.tar && kind load image-archive /tmp/kind-agent.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-agent.tar
+	@podman save $(KIND_IMAGE) -o /tmp/kind-agent.tar && kind load image-archive /tmp/kind-agent.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-agent.tar
 	@podman save $(KIND_MCP_IMAGE) -o /tmp/kind-mcp.tar && kind load image-archive /tmp/kind-mcp.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-mcp.tar
 	@podman save $(KIND_UI_IMAGE) -o /tmp/kind-ui.tar && kind load image-archive /tmp/kind-ui.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-ui.tar
 	@$(MAKE) --no-print-directory kind-gc
@@ -311,12 +318,22 @@ kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
 	@echo "Deploying to Kind..."
 	@$(KCTL) create namespace $(KIND_NS) 2>/dev/null || true
 	@$(KCTL) apply -k deployment/overlays/kind/
-	@$(KCTL) apply -k $(KIND_DIR)/template-mcp-server/deployment/kind/
+	@# Upstream template-mcp-server ships only an openshift overlay now,
+	@# so this is conditional rather than fatal: the agent reaches its
+	@# real MCP servers over the network, and the example one is a
+	@# convenience.
+	@if [ -d "$(KIND_DIR)/template-mcp-server/deployment/kind" ]; then \
+		$(KCTL) apply -k $(KIND_DIR)/template-mcp-server/deployment/kind/; \
+	else \
+		echo "  (skipping MCP server: no kind overlay in template-mcp-server)"; \
+	fi
+	@$(MAKE) --no-print-directory kind-seed-config
 	@echo ""
 	@echo "Waiting for pods..."
+
 	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=database --timeout=60s 2>/dev/null || true
 	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=cache --timeout=60s 2>/dev/null || true
-	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=mcp-server --timeout=90s 2>/dev/null || true
+	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=mcp-server --timeout=30s 2>/dev/null || true
 	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=agent --timeout=120s 2>/dev/null || true
 	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod -l component=ui --timeout=90s 2>/dev/null || true
 	@# --- Step 6: Port-forwards for localhost access ---
@@ -513,3 +530,30 @@ kind-gc:
 	    ctr -n k8s.io leases rm "$$l" >/dev/null 2>&1 || true; \
 	  done' 2>/dev/null || true
 	@podman exec $(KIND_CLUSTER)-control-plane df -h /var 2>/dev/null | tail -1 || true
+
+.PHONY: kind-seed-config
+kind-seed-config: ## Copy config/agent and config/ui onto the config volumes
+	@echo "Seeding config volumes..."
+	@# A pod rather than `kubectl cp` straight to the agent: the agent
+	@# is still in its init container waiting for exactly this, so
+	@# there is nothing to copy into yet.
+	@$(KCTL) -n $(KIND_NS) delete pod config-seeder --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	@$(KCTL) -n $(KIND_NS) apply -f deployment/overlays/kind/config-seeder.yaml >/dev/null
+	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod/config-seeder --timeout=120s >/dev/null
+	@$(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'rm -rf /seed/agent/* /seed/ui/*' >/dev/null
+	@$(KCTL) -n $(KIND_NS) cp config/agent/. config-seeder:/seed/agent/ >/dev/null
+	@# From the same checkout the UI image is built from — the agent
+	@# repo has no config/ui, and seeding the two from different
+	@# places is how they drift.
+	@$(KCTL) -n $(KIND_NS) cp $(KIND_UI_DIR)/config/ui/settings.yaml config-seeder:/seed/ui/ui.yaml >/dev/null
+	@$(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'chmod -R a+rX /seed' >/dev/null
+	@echo "  agent: $$($(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'ls /seed/agent | tr "\n" " "')"
+	@echo "  ui:    $$($(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'ls /seed/ui | tr "\n" " "')"
+	@$(KCTL) -n $(KIND_NS) delete pod config-seeder --wait=false >/dev/null
+	@echo "Config volumes seeded."
+
+.PHONY: kind-reseed
+kind-reseed: kind-seed-config ## Re-seed config and restart the pods that read it
+	@$(KCTL) -n $(KIND_NS) rollout restart deployment/agent deployment/ui >/dev/null
+	@$(KCTL) -n $(KIND_NS) rollout status deployment/agent --timeout=180s
+	@$(KCTL) -n $(KIND_NS) rollout status deployment/ui --timeout=120s
