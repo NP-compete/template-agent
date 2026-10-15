@@ -532,7 +532,7 @@ kind-gc:
 	@podman exec $(KIND_CLUSTER)-control-plane df -h /var 2>/dev/null | tail -1 || true
 
 .PHONY: kind-seed-config
-kind-seed-config: ## Copy config/agent and config/ui onto the config volumes
+kind-seed-config: ## Copy agent and UI config onto the config volume
 	@echo "Seeding config volumes..."
 	@# A pod rather than `kubectl cp` straight to the agent: the agent
 	@# is still in its init container waiting for exactly this, so
@@ -540,7 +540,11 @@ kind-seed-config: ## Copy config/agent and config/ui onto the config volumes
 	@$(KCTL) -n $(KIND_NS) delete pod config-seeder --ignore-not-found --wait=true >/dev/null 2>&1 || true
 	@$(KCTL) -n $(KIND_NS) apply -f deployment/overlays/kind/config-seeder.yaml >/dev/null
 	@$(KCTL) -n $(KIND_NS) wait --for=condition=ready pod/config-seeder --timeout=120s >/dev/null
-	@$(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'rm -rf /seed/agent/* /seed/ui/*' >/dev/null
+	@# One claim with two subtrees. Clear the *contents*, never the
+	@# directories: a subPath mount binds the directory's inode, so
+	@# `rm -rf /seed/agent` leaves every pod that already mounted it
+	@# bound to a deleted inode, reading an empty tree forever.
+	@$(KCTL) -n $(KIND_NS) exec config-seeder -- sh -c 'mkdir -p /seed/agent /seed/ui && rm -rf /seed/agent/* /seed/ui/*' >/dev/null
 	@$(KCTL) -n $(KIND_NS) cp config/agent/. config-seeder:/seed/agent/ >/dev/null
 	@# From the same checkout the UI image is built from — the agent
 	@# repo has no config/ui, and seeding the two from different

@@ -45,6 +45,7 @@ COMPONENT_PATHS = {
     "scaleToZero": "../../components/scale-to-zero",
     "externalChannels": "../../components/external-channels",
     "documentsPvc": "../../components/documents-pvc",
+    "configPvc": "../../components/config-pvc",
 }
 
 BANNER = (

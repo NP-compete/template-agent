@@ -55,8 +55,9 @@ spec:
                   name: agent-config
                   key: REDIS_PORT
           volumeMounts:
-            - name: ui-config
+            - name: config-volume
               mountPath: /etc/config
+              subPath: ui
               readOnly: true
           readinessProbe:
             httpGet:
@@ -79,9 +80,9 @@ spec:
               memory: "1Gi"
               cpu: "500m"
       volumes:
-        - name: ui-config
+        - name: config-volume
           persistentVolumeClaim:
-            claimName: ui-config-pvc
+            claimName: config-pvc
 ---
 apiVersion: v1
 kind: Service

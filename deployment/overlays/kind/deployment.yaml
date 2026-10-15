@@ -38,8 +38,9 @@ spec:
               done
               echo "config present"
           volumeMounts:
-            - name: agent-config-volume
+            - name: config-volume
               mountPath: /app/config/agent
+              subPath: agent
               readOnly: true
       containers:
         - name: agent
@@ -219,11 +220,13 @@ spec:
               memory: "2Gi"
               cpu: "500m"
           volumeMounts:
-            # Config, read from the volume rather than from the image.
+            # Config, read from the shared volume's `agent/` subtree
+            # rather than from the image.
             # CONFIG_PATH in the base ConfigMap already points here;
             # what changes is who supplies it.
-            - name: agent-config-volume
+            - name: config-volume
               mountPath: /app/config/agent
+              subPath: agent
               readOnly: true
             # Documents, exposed to the agent at /documents/. readOnly
             # at the mount as well as in the backend and the
@@ -237,9 +240,9 @@ spec:
             - name: agent-documents
               mountPath: /app/data/documents
       volumes:
-        - name: agent-config-volume
+        - name: config-volume
           persistentVolumeClaim:
-            claimName: agent-config-pvc
+            claimName: config-pvc
         - name: agent-documents
           persistentVolumeClaim:
             claimName: agent-documents-pvc

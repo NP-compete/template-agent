@@ -32,6 +32,13 @@ components:
   # is large, it changes without a release, and CONFIG_PATH is walked
   # on every reload check.
   documentsPvc: true
+  # A volume holding config/agent and the UI's settings, mounted at
+  # CONFIG_PATH. The alternative for a cluster with no mount was a
+  # derived image (Containerfile.config) for the agent and a ConfigMap
+  # for the UI — the first makes a rebuild the only way to change a
+  # prompt, the second is read-only in the pod and rewritten by the
+  # next apply.
+  configPvc: true
 
 app:
   name: agent

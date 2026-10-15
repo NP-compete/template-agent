@@ -253,6 +253,117 @@ async def read_prompt() -> dict[str, Any]:
     return {"name": path.name, "files": [_split_markdown(path)]}
 
 
+def _provider_of(model: str) -> str:
+    """Which provider serves this name.
+
+    By prefix, like `llm.create_model` decides it — an allowlist here
+    would be a second list to keep in step, and the one that goes
+    stale is always the copy.
+    """
+    from deep_agent.src.agent.llm import (
+        is_claude_model,
+        is_openai_model,
+        is_vertex_model,
+    )
+
+    name = (model or "").strip()
+    if not name:
+        return "unknown"
+    if is_claude_model(name):
+        return "anthropic-vertex"
+    if is_vertex_model(name):
+        return "google-vertex"
+    if is_openai_model(name):
+        return "openai"
+    # Everything else goes to the configured OpenAI-compatible
+    # endpoint, which is how a local stub or a self-hosted model is
+    # reached.
+    return "openai-compatible"
+
+
+@router.get("/models")
+async def list_models() -> dict[str, Any]:
+    """Which model answers, and which model each subagent uses.
+
+    Ungated for the same reason the skill list is: "which model wrote
+    this" is a question a reader of an answer is entitled to ask, and
+    it is the first thing anyone checks when an answer looks wrong.
+
+    Names and roles only. Endpoints, project ids and credentials are
+    deployment facts, not capability facts, and belong in /admin.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    def _name_of(raw: Any) -> str:
+        # `model:` is either a bare name or a mapping with one.
+        if isinstance(raw, dict):
+            return str(raw.get("name") or "").strip()
+        return str(raw or "").strip()
+
+    entries: list[dict[str, Any]] = []
+
+    orchestrator = ""
+    try:
+        orchestrator = _name_of(
+            (agent_config.get_orchestrator_config() or {}).get("model")
+        )
+    except Exception:
+        logger.debug("Could not read the orchestrator model", exc_info=True)
+    if orchestrator:
+        entries.append(
+            {
+                "role": "orchestrator",
+                "name": orchestrator,
+                "provider": _provider_of(orchestrator),
+                "used_by": "The agent itself — every turn that is not delegated.",
+            }
+        )
+
+    try:
+        subagents = agent_config.get_all_subagent_configs() or {}
+    except Exception:
+        logger.debug("Could not read subagent configs", exc_info=True)
+        subagents = {}
+
+    for name in sorted(subagents):
+        cfg = subagents.get(name) or {}
+        model = _name_of(cfg.get("model")) or orchestrator
+        entries.append(
+            {
+                "role": "subagent",
+                "name": model,
+                "provider": _provider_of(model),
+                "used_by": name,
+                # True when the subagent names no model of its own, so
+                # a reader can tell "chose this" from "inherited it".
+                "inherited": not _name_of(cfg.get("model")),
+            }
+        )
+
+    routing: dict[str, Any] = {"enabled": False, "tiers": []}
+    try:
+        from deep_agent.src.routing.config import load_router_config
+
+        router_cfg = load_router_config()
+        routing = {
+            "enabled": bool(router_cfg.enabled),
+            "strategy": router_cfg.strategy,
+            "tiers": [
+                {
+                    "tier": tier.name,
+                    "name": tier.model,
+                    "provider": _provider_of(tier.model),
+                    "criteria": tier.criteria,
+                }
+                for tier in router_cfg.tiers
+            ],
+        }
+    except Exception:
+        logger.debug("Could not read the router config", exc_info=True)
+
+    return {"models": entries, "routing": routing}
+
+
 @router.get("/auth/whoami")
 async def whoami(request: Request) -> dict[str, Any]:
     """Who this credential belongs to, and whether it is privileged.

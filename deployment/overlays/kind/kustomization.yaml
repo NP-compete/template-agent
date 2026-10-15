@@ -9,7 +9,6 @@ resources:
   - service.yaml
   - ui.yaml
   - ingress.yaml
-  - mock-llm.yaml
 
 # Include postgres and redis for local development
 components:
