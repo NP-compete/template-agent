@@ -111,3 +111,59 @@ class TestCleanFork:
 
         assert report.errors == []
         assert report.warnings == []
+
+
+class TestExampleMarkersComeFromConfig:
+    """The needles live in config, not in Python.
+
+    A brand name in a .py is one a fork has to find in source; and the
+    needle has to track whatever the shipped config carries anyway, so
+    the two belong in the same place.
+    """
+
+    def test_a_renamed_example_is_caught_by_editing_config_alone(
+        self, config_copy: Path
+    ):
+        markers = config_copy / "runtime" / "template-markers.yaml"
+        markers.write_text(
+            yaml.safe_dump(
+                {
+                    "markers": [
+                        {
+                            "needle": "Sales Copilot",
+                            "file": "runtime/agent.yaml",
+                            "message": "agent name is still the example's",
+                        }
+                    ]
+                }
+            )
+        )
+        agent_yaml = config_copy / "runtime" / "agent.yaml"
+        raw = yaml.safe_load(agent_yaml.read_text())
+        raw["name"] = "Sales Copilot"
+        agent_yaml.write_text(yaml.safe_dump(raw))
+
+        warnings = [w.message for w in validate_config(config_copy).warnings]
+        assert any("still the example's" in w for w in warnings)
+
+    def test_deleting_the_marker_file_turns_the_checks_off(self, config_copy: Path):
+        # A reasonable thing for a finished fork to do, and an
+        # explicit act rather than a silent one.
+        (config_copy / "runtime" / "template-markers.yaml").unlink()
+
+        warnings = [w.message for w in validate_config(config_copy).warnings]
+        assert not any("still the example's" in w for w in warnings)
+
+    def test_a_malformed_marker_file_does_not_fail_validation(self, config_copy: Path):
+        (config_copy / "runtime" / "template-markers.yaml").write_text("{[not yaml")
+
+        report = validate_config(config_copy)
+        assert not any("still the example's" in w.message for w in report.warnings)
+
+    def test_an_entry_missing_a_field_is_skipped(self, config_copy: Path):
+        (config_copy / "runtime" / "template-markers.yaml").write_text(
+            yaml.safe_dump({"markers": [{"needle": "Example Agent"}, "not a mapping"]})
+        )
+
+        report = validate_config(config_copy)
+        assert not any("still the example's" in w.message for w in report.warnings)

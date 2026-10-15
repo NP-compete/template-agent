@@ -93,25 +93,42 @@ def _validate_model(
     return None
 
 
-# Example content that should not survive into a real agent. Each entry is
-# (needle, where to look, what to say).
-_EXAMPLE_MARKERS: list[tuple[str, str, str]] = [
-    # These track whatever name the shipped config carries. Renaming the
-    # example without renaming the needles leaves a check that can never
-    # fire — it would pass silently for a fork that changed nothing.
-    ("Workpilot", "runtime/agent.yaml", "agent name is still the example's"),
-    ("Workpilot", "PROMPT.md", "prompt is still the example's"),
-    (
-        "template-mcp-server",
-        "integrations/mcp.json",
-        "MCP server is still the example's",
-    ),
-]
+# Where the example-content markers live. Kept in config, not here:
+# a brand name in a .py is a name somebody has to find in source when
+# they fork, and the needles have to track whatever the shipped config
+# carries anyway.
+_MARKERS_FILE = "runtime/template-markers.yaml"
+
+
+def _example_markers(config_dir: Path) -> list[tuple[str, str, str]]:
+    """Load the marker list. A missing or unreadable file means none."""
+    path = config_dir / _MARKERS_FILE
+    if not path.is_file():
+        return []
+    try:
+        raw = yaml.safe_load(path.read_text()) or {}
+        entries = raw.get("markers") or []
+    except Exception:
+        # A malformed marker file must not fail validation of the
+        # config it is describing.
+        return []
+
+    markers: list[tuple[str, str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        needle = str(entry.get("needle") or "")
+        rel = str(entry.get("file") or "")
+        if needle and rel:
+            markers.append(
+                (needle, rel, str(entry.get("message") or "is still the example's"))
+            )
+    return markers
 
 
 def _check_example_leftovers(report: Report, config_dir: Path) -> None:
     """Warn about demo content a fork should have replaced."""
-    for needle, rel, message in _EXAMPLE_MARKERS:
+    for needle, rel, message in _example_markers(config_dir):
         path = config_dir / rel
         if not path.is_file():
             continue
