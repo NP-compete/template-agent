@@ -197,3 +197,54 @@ class TestRoute:
 
         assert result == "answered"
         handler.assert_awaited_once_with(request)
+
+
+class TestRoutingIsRecorded:
+    """Routing must be visible after the fact.
+
+    Two turns in one conversation can come from different models and
+    the transcript looks identical, so the choice goes on the message
+    that came back.
+    """
+
+    @pytest.mark.asyncio
+    async def test_records_the_tier_and_how_it_was_chosen(self):
+        from types import SimpleNamespace
+
+        answered = SimpleNamespace(additional_kwargs={}, content="hi")
+        request = _request([{"type": "human", "content": "something hard"}])
+        decision = RoutingDecision(
+            tier=STRONG, reason="looks hard", method="classifier"
+        )
+
+        captured = {}
+
+        def _wrap(fn, name=None):
+            captured["fn"] = fn
+            return MagicMock()
+
+        with (
+            patch("langchain.agents.middleware.wrap_model_call", _wrap),
+            patch(
+                "deep_agent.src.agent.llm.create_model",
+                MagicMock(return_value=MagicMock()),
+            ),
+            patch(
+                "deep_agent.src.routing.middleware.choose_tier",
+                new=AsyncMock(return_value=decision),
+            ),
+        ):
+            build_model_router_middleware(_config())
+            await captured["fn"](request, AsyncMock(return_value=answered))
+
+        assert answered.additional_kwargs["routed_tier"] == "strong"
+        assert answered.additional_kwargs["routed_by"] == "classifier"
+
+    @pytest.mark.asyncio
+    async def test_an_unannotatable_response_does_not_fail_the_turn(self):
+        # A missing annotation costs a line of provenance; failing
+        # here would trade the answer for the footnote.
+        request = _request([{"type": "human", "content": "hi"}])
+        decision = RoutingDecision(tier=STRONG, reason="hard", method="rule")
+        result, _ = await _run_route(_config(), request, decision)
+        assert result == "answered"

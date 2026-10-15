@@ -89,6 +89,20 @@ def build_model_router_middleware(
             clients[tier_name] = None
         return clients[tier_name]
 
+    def _annotate(response: Any, fields: dict[str, Any]) -> None:
+        """Attach fields to the returned message, best effort.
+
+        Never raises: a missing annotation costs a line of provenance,
+        and failing the turn over it would trade the answer for the
+        footnote.
+        """
+        message = getattr(response, "result", None) or response
+        if isinstance(message, list) and message:
+            message = message[0]
+        existing = getattr(message, "additional_kwargs", None)
+        if isinstance(existing, dict):
+            existing.update(fields)
+
     async def route(request: Any, handler: Any) -> Any:
         state = getattr(request, "state", None) or {}
         messages = list(getattr(request, "messages", []) or [])
@@ -122,7 +136,14 @@ def build_model_router_middleware(
             return await handler(request)
 
         routed = request.override(model=client)
-        return await handler(routed)
+        response = await handler(routed)
+
+        # Record the choice on the message that came back, so the
+        # reader can see which tier answered. Without it routing is
+        # invisible: two turns in one conversation can come from
+        # different models and the transcript looks identical.
+        _annotate(response, {"routed_tier": chosen_name, "routed_by": method})
+        return response
 
     middleware = wrap_model_call(route, name="ModelRouterMiddleware")
     logger.info(

@@ -364,6 +364,65 @@ async def list_models() -> dict[str, Any]:
     return {"models": entries, "routing": routing}
 
 
+@router.get("/safeguards")
+async def list_safeguards() -> dict[str, Any]:
+    """What is applied to a message besides the model.
+
+    PII scrubbing, guardrails and the token budget all change what
+    the model sees or what comes back, and all of them are silent:
+    a redacted input looks like the text you typed, a filtered reply
+    looks like an ordinary one, and a run stopped by the budget looks
+    like a model with little to say.
+
+    Ungated, like the rest of Components. "Is what I type being
+    redacted before it reaches the model" is a question the person
+    typing is entitled to have answered, and answering it only for
+    operators is the same as not answering it.
+
+    State and scope, never values: which entity classes are matched,
+    not the patterns; that a guardrail model is configured, not where
+    it lives.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    # The typed accessors, not get_raw_section: pii lives in its own
+    # file and guardrails and the budget are parsed into models, so
+    # reading raw sections returned empty for all three and reported
+    # "nothing is on" for a config where things were.
+    def _read(fn: str, default: Any) -> Any:
+        try:
+            return getattr(agent_config, fn)()
+        except Exception:
+            logger.debug("Could not read config via %s", fn, exc_info=True)
+            return default
+
+    pii = _read("get_custom_pii_config", None)
+    guardrail = _read("get_guardrails_config", None)
+    budget = _read("get_token_budget_config", None)
+
+    return {
+        "pii": {
+            "enabled": bool(getattr(pii, "enabled", False)),
+            # What is matched, not how. A redaction pattern is a map
+            # of what evades it.
+            "entities": sorted(
+                str(rule.name)
+                for rule in (getattr(pii, "rules", None) or [])
+                if rule.name
+            ),
+            # Applies to traces rather than to the model's input, and
+            # the difference matters to anyone reading this.
+            "trace_strategy": str(getattr(pii, "trace_strategy", "") or ""),
+        },
+        # Just the switch. A "model configured" flag looked useful
+        # and would have been wrong: the loader drops `model` when
+        # guardrails are disabled, so it reported "none configured"
+        # for a config that names one.
+        "guardrail": {"enabled": bool(getattr(guardrail, "enabled", False))},
+        "token_budget": {"enabled": bool(getattr(budget, "enabled", False))},
+    }
+
+
 @router.get("/auth/whoami")
 async def whoami(request: Request) -> dict[str, Any]:
     """Who this credential belongs to, and whether it is privileged.
