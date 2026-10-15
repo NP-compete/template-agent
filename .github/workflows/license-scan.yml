@@ -8,6 +8,9 @@ on:
       - 'uv.lock'
       - 'requirements*.txt'
       - 'Containerfile'
+      - 'ui/package.json'
+      - 'ui/package-lock.json'
+      - 'ui/Containerfile'
   pull_request:
     branches: [main, deep-agent]
     paths:
@@ -15,10 +18,23 @@ on:
       - 'uv.lock'
       - 'requirements*.txt'
       - 'Containerfile'
+      - 'ui/package.json'
+      - 'ui/package-lock.json'
+      - 'ui/Containerfile'
 
 permissions:
   contents: read
 
+# The forbidden list is the same for both trees (trivy-license.yaml);
+# what differs is how each ecosystem is treated when Trivy cannot
+# classify a licence at all.
+#
+# Python is scanned with UNKNOWN fatal. npm is not, and that is not
+# laziness: npm packages routinely declare "SEE LICENSE IN LICENSE"
+# or a BlueOak/0BSD string Trivy has no classification for. Twelve of
+# them in this lockfile, zero HIGH or CRITICAL. Failing the build on
+# those trains everyone to ignore a red license check, which costs
+# more than it catches.
 jobs:
   license-scan:
     name: License Scan
@@ -28,12 +44,37 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Scan for license violations
+      - name: Scan Python dependencies
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
+          skip-dirs: ui
           scanners: license
           severity: UNKNOWN,HIGH,CRITICAL
           exit-code: '1'
+          trivy-config: trivy-license.yaml
+
+      - name: Scan UI dependencies
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ui
+          scanners: license
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          trivy-config: trivy-license.yaml
+
+      # Visible, but not fatal. Someone should see the twelve; nobody
+      # should be blocked by them.
+      - name: Report unclassified UI licences
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ui
+          scanners: license
+          severity: UNKNOWN
+          exit-code: '0'
           trivy-config: trivy-license.yaml

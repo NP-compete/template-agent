@@ -24,3 +24,21 @@ updates:
         update-types:
           - minor
           - patch
+
+  # UI. `directory` is where the manifest lives, so npm points at
+  # /ui and docker needs its own entry for ui/Containerfile — the
+  # root docker entry above only sees the agent's.
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker
+    directory: "/ui"
+    schedule:
+      interval: weekly

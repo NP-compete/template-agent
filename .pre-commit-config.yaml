@@ -21,10 +21,15 @@ repos:
       - id: check-case-conflict
       - id: check-docstring-first
       - id: check-json
-        # JSONC: comments are intentional and `_load_jsonc` strips
-        # them. Matches both the current path and the pre-rename one,
-        # since `config.paths` still accepts the latter.
-        exclude: ^config/agent/(integrations/)?mcp\.json$
+        # JSONC, all of them. The agent's mcp.json has comments by
+        # design and `_load_jsonc` strips them; tsconfig has always
+        # allowed comments and TypeScript reads it happily. The hook
+        # only speaks strict JSON.
+        exclude: |
+          (?x)^(
+            config/agent/(integrations/)?mcp\.json|
+            ui/tsconfig(\.node)?\.json
+          )$
       - id: check-toml
       - id: detect-private-key
         exclude: ^tests/
