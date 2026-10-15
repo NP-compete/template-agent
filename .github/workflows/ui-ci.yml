@@ -83,7 +83,12 @@ jobs:
     timeout-minutes: 15
     needs: build
     container:
-      image: mcr.microsoft.com/playwright:v1.61.1-noble
+      # Must track @playwright/test in ui/package.json exactly: the
+      # image ships the browser build that version expects, and a
+      # mismatch fails every test in 3ms with "Executable doesn't
+      # exist". The package was pinned to 1.64.0 while this stayed at
+      # 1.61.1, which is how that happened.
+      image: mcr.microsoft.com/playwright:v1.64.0-noble
     env:
       CI: "true"
     steps:
