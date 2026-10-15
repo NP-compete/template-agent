@@ -24,6 +24,7 @@ from deep_agent.aegra.eval_routes import eval_mgmt_router
 from deep_agent.aegra.eval_routes import router as eval_router
 from deep_agent.aegra.feedback import feedback_router
 from deep_agent.aegra.fork_routes import router as fork_router
+from deep_agent.aegra.mcp_crypto import McpKeyMissingError
 from deep_agent.aegra.mcp_routes import router as mcp_router
 from deep_agent.aegra.personalization_routes import router as personalization_router
 from deep_agent.aegra.projects_routes import projects_router
@@ -128,6 +129,34 @@ def _verify_custom_thread_delete(application: FastAPI) -> None:
 
 
 app = FastAPI(title="template-agent-custom", lifespan=_lifespan)
+
+
+@app.exception_handler(McpKeyMissingError)
+async def mcp_key_missing_handler(
+    request: Request, exc: McpKeyMissingError
+) -> JSONResponse:
+    """Answer a missing token-encryption key with what is missing.
+
+    Without this it reached the catch-all below and came back as
+    "An unexpected error occurred. Please try again later." — advice
+    to wait for a condition that will never change on its own, for a
+    fault the server had already identified precisely. Connecting an
+    MCP server then looks like a broken integration rather than an
+    unfinished deployment.
+
+    503 rather than 500: the dependency the request needs is not
+    configured, and retrying is pointless until it is. The message
+    names an environment variable and how to generate a value — no
+    secret, and nothing an operator does not already have.
+    """
+    logger.error("MCP token encryption key missing: %s", exc)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": str(exc),
+            "error_type": "configuration_error",
+        },
+    )
 
 
 @app.exception_handler(Exception)
