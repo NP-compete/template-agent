@@ -332,3 +332,42 @@ class TestIsReady:
     def test_not_ready_initially(self):
         startup._startup_complete = False
         assert startup.is_ready() is False
+
+
+class TestWarmGraph:
+    """Pre-building the graph is never fatal.
+
+    A cold build is ~2s against ~45ms warm, paid on every deploy and —
+    with scale-to-zero — on the first request after an idle period,
+    which is exactly when someone is watching. A pod that cannot
+    pre-build must still serve.
+    """
+
+    async def test_warms_the_graph(self):
+        agent = AsyncMock()
+        with patch.dict(
+            "sys.modules",
+            {"deep_agent.aegra.graph": MagicMock(agent=agent)},
+        ):
+            assert await startup._warm_graph() == "graph warmed"
+        agent.assert_awaited_once()
+
+    async def test_builds_with_no_user_so_the_cache_key_is_the_shared_one(self):
+        # The factory skips MCP when user is None, and the entry it
+        # populates is the one the first real request looks for.
+        agent = AsyncMock()
+        with patch.dict(
+            "sys.modules", {"deep_agent.aegra.graph": MagicMock(agent=agent)}
+        ):
+            await startup._warm_graph()
+        runtime = agent.await_args.args[0]
+        assert runtime.user is None
+
+    async def test_a_failed_warmup_is_reported_not_raised(self):
+        agent = AsyncMock(side_effect=RuntimeError("no credentials"))
+        with patch.dict(
+            "sys.modules", {"deep_agent.aegra.graph": MagicMock(agent=agent)}
+        ):
+            result = await startup._warm_graph()
+        assert result.startswith("graph not warmed")
+        assert "no credentials" in result

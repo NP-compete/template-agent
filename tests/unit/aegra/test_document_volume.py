@@ -112,3 +112,77 @@ class TestListDocuments:
             await dr.list_documents(MagicMock())
         assert exc.value.status_code == 403
         assert auth.await_args.kwargs["developer_only"] is True
+
+
+class TestReadDocument:
+    @pytest.mark.asyncio
+    async def test_reads_a_file(self, tmp_path):
+        (tmp_path / "notes.md").write_text("hello")
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+        ):
+            body = await dr.read_document("notes.md", MagicMock())
+        assert body["content"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_404_for_a_file_that_is_not_there(self, tmp_path):
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await dr.read_document("missing.md", MagicMock())
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_400_for_a_directory(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await dr.read_document("sub", MagicMock())
+        assert exc.value.status_code == 400
+
+
+class TestDeleteDocument:
+    @pytest.mark.asyncio
+    async def test_deletes_and_reports_usage(self, tmp_path):
+        (tmp_path / "gone.txt").write_bytes(b"12345")
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+        ):
+            body = await dr.delete_document("gone.txt", MagicMock())
+
+        assert body["deleted"] == "gone.txt"
+        assert body["usage"]["used_bytes"] == 0
+        assert not (tmp_path / "gone.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_404_for_a_file_that_is_not_there(self, tmp_path):
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await dr.delete_document("missing.txt", MagicMock())
+        assert exc.value.status_code == 404
+
+
+class TestWriteDocument:
+    @pytest.mark.asyncio
+    async def test_415_for_an_unreadable_type(self, tmp_path):
+        # The agent reads these as text; a type it cannot read is a
+        # silent no-op rather than a stored file.
+        with (
+            patch.object(dr, "authenticated_user_id", new=AsyncMock(return_value="u1")),
+            patch.object(dr, "_root", return_value=tmp_path),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await dr.write_document(
+                "payload.bin", dr.DocumentBody(content="x"), MagicMock()
+            )
+        assert exc.value.status_code == 415
