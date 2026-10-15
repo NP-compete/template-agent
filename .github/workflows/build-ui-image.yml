@@ -1,4 +1,4 @@
-name: Build and Push Base Image
+name: Build and Push UI Image
 
 on:
   push:
@@ -7,12 +7,18 @@ on:
     branches:
       - main
       - deep-agent
+    paths:
+      - 'ui/**'
+      - '.github/workflows/build-ui-image.yml'
   pull_request:
     branches: [ main, deep-agent ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'tests/**'
+    # Negations rather than `paths-ignore`: GitHub rejects a workflow
+    # that sets both on one event.
+    paths:
+      - 'ui/**'
+      - '!ui/**/*.md'
+      - '!ui/docs/**'
+      - '.github/workflows/build-ui-image.yml'
   workflow_dispatch:
 
 permissions:
@@ -57,7 +63,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}/ui
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
@@ -81,8 +87,8 @@ jobs:
       - name: Build image locally for scanning
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
-          context: .
-          file: ./Containerfile
+          context: ./ui
+          file: ./ui/Containerfile
           push: false
           load: true
           tags: scan-target:${{ steps.version.outputs.version }}
@@ -97,7 +103,7 @@ jobs:
           format: table
           severity: CRITICAL,HIGH
           scanners: vuln
-          trivyignores: .trivyignore
+          trivyignores: ui/.trivyignore
           exit-code: '0'
 
       - name: Fail on critical vulnerabilities
@@ -107,7 +113,7 @@ jobs:
           format: table
           severity: CRITICAL
           scanners: vuln
-          trivyignores: .trivyignore
+          trivyignores: ui/.trivyignore
           exit-code: '1'
 
       - name: Generate Trivy JSON report
@@ -172,8 +178,8 @@ jobs:
         id: push
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
-          context: .
-          file: ./Containerfile
+          context: ./ui
+          file: ./ui/Containerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -184,7 +190,7 @@ jobs:
       - name: Verify pushed image is pullable
         if: github.event_name != 'pull_request'
         run: |
-          docker pull ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+          docker pull ghcr.io/${{ github.repository }}/ui@${{ steps.push.outputs.digest }}
           echo "Image pull verified successfully"
 
       - name: Sign image with cosign
@@ -194,7 +200,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             if cosign sign --yes --recursive \
-              ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}; then
+              ghcr.io/${{ github.repository }}/ui@${{ steps.push.outputs.digest }}; then
               echo "signed=true" >> $GITHUB_OUTPUT
               exit 0
             fi
@@ -211,7 +217,7 @@ jobs:
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+            ghcr.io/${{ github.repository }}/ui@${{ steps.push.outputs.digest }}
           echo "Signature verification passed"
 
       - name: Attest build provenance
@@ -219,44 +225,44 @@ jobs:
         continue-on-error: true
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ghcr.io/${{ github.repository }}/ui
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
       - name: Create deployment package metadata
         if: github.event_name != 'pull_request'
         run: |
-          cat > deployment/release-info.json <<EOF
+          cat > ui/deployment/release-info.json <<EOF
           {
             "version": "${{ steps.version.outputs.version }}",
             "git_ref": "${{ github.ref }}",
             "git_sha": "${{ github.sha }}",
             "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "container_image": "ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}",
+            "container_image": "ghcr.io/${{ github.repository }}/ui:${{ steps.version.outputs.version }}",
             "container_digest": "${{ steps.push.outputs.digest }}",
             "signed": ${{ steps.sign.outputs.signed || false }},
             "repository": "${{ github.repository }}"
           }
           EOF
-          cat deployment/release-info.json
+          cat ui/deployment/release-info.json
 
       - name: Stamp image reference into deployment manifests
         if: github.event_name != 'pull_request'
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ghcr.io/${{ github.repository }}/ui
         run: |
-          cd deployment/overlays/openshift
+          cd ui/deployment/overlays/openshift
           kustomize edit set image "template-ui=${IMAGE}:${VERSION}"
-          echo "Stamped image ${IMAGE}:${VERSION} into deployment/overlays/openshift/kustomization.yaml"
+          echo "Stamped image ${IMAGE}:${VERSION} into ui/deployment/overlays/openshift/kustomization.yaml"
           grep -A3 'images:' kustomization.yaml
 
       - name: Create deployment package
         if: github.event_name != 'pull_request'
         run: |
-          cd deployment
-          zip -r ../${{ steps.version.outputs.package_name }} . -x "*.git*"
-          cd ..
+          cd ui/deployment
+          zip -r ../../${{ steps.version.outputs.package_name }} . -x "*.git*"
+          cd ../..
           echo "Created package: ${{ steps.version.outputs.package_name }}"
           ls -lh ${{ steps.version.outputs.package_name }}
 
@@ -293,7 +299,7 @@ jobs:
             ## Container Image
 
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            docker pull ghcr.io/${{ github.repository }}/ui:${{ steps.version.outputs.version }}
             ```
 
             **Digest:** `${{ steps.push.outputs.digest }}`
@@ -306,11 +312,11 @@ jobs:
             cosign verify \
               --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \
               --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-              ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+              ghcr.io/${{ github.repository }}/ui:${{ steps.version.outputs.version }}
 
             # Verify build provenance
             gh attestation verify \
-              oci://ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }} \
+              oci://ghcr.io/${{ github.repository }}/ui:${{ steps.version.outputs.version }} \
               --owner ${{ github.repository_owner }}
 
             # Verify artifact checksums
@@ -343,7 +349,7 @@ jobs:
         if: github.event_name != 'pull_request'
         continue-on-error: true
         run: |
-          echo "### Base Image Built Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "### UI Image Built Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.push.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
@@ -356,7 +362,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ghcr.io/${{ github.repository }}/ui@${{ steps.push.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Verify signature:**" >> $GITHUB_STEP_SUMMARY
@@ -364,5 +370,5 @@ jobs:
           echo 'cosign verify \' >> $GITHUB_STEP_SUMMARY
           echo '  --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \' >> $GITHUB_STEP_SUMMARY
           echo '  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \' >> $GITHUB_STEP_SUMMARY
-          echo '  ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}' >> $GITHUB_STEP_SUMMARY
+          echo '  ghcr.io/${{ github.repository }}/ui:${{ steps.version.outputs.version }}' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

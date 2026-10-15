@@ -255,8 +255,9 @@ KIND_HTTP_PORT ?= 8081
 KIND_HTTPS_PORT ?= 8444
 KIND_MCP_REPO := https://github.com/redhat-data-and-ai/template-mcp-server.git
 KIND_MCP_BRANCH ?= main
-KIND_UI_REPO := https://github.com/redhat-data-and-ai/template-ui.git
-KIND_UI_BRANCH ?= main
+# No KIND_UI_REPO: the UI lives in ui/ and is built from the working
+# tree. Cloning it was how `make kind` ended up testing main while you
+# were editing a branch.
 KCTL := kubectl --context $(KIND_CTX)
 
 kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
@@ -266,20 +267,13 @@ kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
 	@echo "╚════════════════════════════════════════════════════════════════╝"
 	@which kind > /dev/null || (echo "Error: kind not found. Install: https://kind.sigs.k8s.io" && exit 1)
 	@which kubectl > /dev/null || (echo "Error: kubectl not found." && exit 1)
-	@# --- Step 1: Clone MCP server and UI if needed ---
+	@# --- Step 1: Clone the MCP server if needed (the UI is in-tree) ---
 	@if [ ! -d "$(KIND_DIR)/template-mcp-server" ]; then \
 		echo "Cloning template-mcp-server (branch: $(KIND_MCP_BRANCH))..."; \
 		mkdir -p $(KIND_DIR); \
 		git clone --branch $(KIND_MCP_BRANCH) --depth 1 $(KIND_MCP_REPO) $(KIND_DIR)/template-mcp-server; \
 	else \
 		echo "MCP server already cloned"; \
-	fi
-	@if [ ! -d "$(KIND_DIR)/template-ui" ]; then \
-		echo "Cloning template-ui (branch: $(KIND_UI_BRANCH))..."; \
-		mkdir -p $(KIND_DIR); \
-		git clone --branch $(KIND_UI_BRANCH) --depth 1 $(KIND_UI_REPO) $(KIND_DIR)/template-ui; \
-	else \
-		echo "UI already cloned"; \
 	fi
 	@# --- Step 2: Create cluster if not exists ---
 	@if ! kind get clusters 2>/dev/null | grep -q "$(KIND_CLUSTER)"; then \
@@ -300,8 +294,8 @@ kind: ## Deploy full stack (agent + MCP + UI) to a local Kind cluster
 	@podman build -t $(KIND_AGENT_CONFIG_IMAGE) --build-arg BASE=$(KIND_IMAGE) -f Containerfile.config .
 	@echo "Building MCP server image..."
 	@podman build -t $(KIND_MCP_IMAGE) -f $(KIND_DIR)/template-mcp-server/Containerfile $(KIND_DIR)/template-mcp-server
-	@echo "Building UI image..."
-	@podman build -t $(KIND_UI_IMAGE) $(KIND_DIR)/template-ui
+	@echo "Building UI image from ui/..."
+	@podman build -t $(KIND_UI_IMAGE) ui
 	@echo "Loading images into Kind (podman -> archive -> kind)..."
 	@podman save $(KIND_AGENT_CONFIG_IMAGE) -o /tmp/kind-agent.tar && kind load image-archive /tmp/kind-agent.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-agent.tar
 	@podman save $(KIND_MCP_IMAGE) -o /tmp/kind-mcp.tar && kind load image-archive /tmp/kind-mcp.tar --name $(KIND_CLUSTER) && rm -f /tmp/kind-mcp.tar
@@ -513,3 +507,39 @@ kind-gc:
 	    ctr -n k8s.io leases rm "$$l" >/dev/null 2>&1 || true; \
 	  done' 2>/dev/null || true
 	@podman exec $(KIND_CLUSTER)-control-plane df -h /var 2>/dev/null | tail -1 || true
+
+# ──────────────────────────────────────────────────────────────────
+# UI
+#
+# Delegated rather than reimplemented: ui/Makefile already knows how
+# to build, test and run the UI, and a second copy here would be the
+# one that goes stale. `make -C ui` keeps one definition.
+#
+# Prefixed because the names collide — both trees have `test`, `dev`,
+# `install`, `clean` and `local`. `make test` stays the agent's, which
+# is what someone standing in the repo root means by it.
+# ──────────────────────────────────────────────────────────────────
+.PHONY: ui-install ui-dev ui-test ui-lint ui-build ui-clean ui-check
+
+ui-install: ## Install UI dependencies
+	@$(MAKE) --no-print-directory -C ui install
+
+ui-dev: ## Run the UI dev server (Vite + Fastify)
+	@$(MAKE) --no-print-directory -C ui dev
+
+ui-test: ## Run the UI unit tests
+	@$(MAKE) --no-print-directory -C ui test
+
+ui-lint: ## Lint the UI
+	@cd ui && npm run lint
+
+ui-build: ## Build the UI for production
+	@cd ui && npm run build
+
+ui-clean: ## Tear down the UI's local containers and artifacts
+	@$(MAKE) --no-print-directory -C ui clean
+
+ui-check: ui-lint ui-test ## Lint and test the UI, as CI does
+
+.PHONY: check-all
+check-all: test ui-check ## Everything both trees check in CI

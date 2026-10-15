@@ -8,7 +8,7 @@ export interface UserData {
   family_name: string;
   givenName: string;
   given_name: string;
-  mail: string; 
+  mail: string;
   name: string;
   preferred_username: string;
   rhatUUID: string;

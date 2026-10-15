@@ -72,7 +72,7 @@ local:
 
 local-down:
 	@export PODMAN_COMPOSE_SILENT=true && podman-compose stop redis
-	
+
 container:
 	@export PODMAN_COMPOSE_SILENT=true && podman-compose --no-ansi up --build --force-recreate --remove-orphans --timeout=60
 
@@ -191,4 +191,3 @@ undeploy:
 
 %:
 	@:
-	

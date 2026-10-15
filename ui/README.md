@@ -33,7 +33,7 @@ A modern React-based frontend application with Fastify backend for interacting w
    ```bash
    cp env.template .env
    ```
-   
+
    Edit `.env` and configure the required variables (see [Environment Configuration](#environment-configuration) below).
 
 5. **Start development server**

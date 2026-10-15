@@ -87,7 +87,7 @@ export function useDataStream({
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
-      
+
       if (refreshableToken) {
         headers["X-Token"] = refreshableToken;
       }

@@ -42,7 +42,42 @@ reviews:
     - "!**/.gitignore"
     - "!**/LICENSE"
     - "!.env*"
+    - "!**/package-lock.json"
+    - "!ui/dist/**"
+    - "!ui/playwright-report/**"
   path_instructions:
+    # UI. Paths are repo-relative, so every rule the UI repo carried
+    # needed a `ui/` prefix; without it they silently match nothing
+    # and the review falls back to generic feedback.
+    - path: "ui/src/server/**/*.ts"
+      instructions: >-
+        Focus on correctness and security: unvalidated user input, missing
+        auth checks, SQL/NoSQL injection, SSRF, missing rate limiting,
+        unhandled promise rejections, missing error responses, Redis
+        connection leaks, and missing request validation. Skip style and
+        naming feedback.
+    - path: "ui/src/frontend/**/*.{ts,tsx}"
+      instructions: >-
+        Focus on correctness: missing key props, stale closures, incorrect
+        dependency arrays in hooks, XSS via dangerouslySetInnerHTML,
+        memory leaks from missing cleanup in useEffect, and incorrect
+        Redux state mutations. Skip style feedback.
+    - path: "ui/e2e/**/*.ts"
+      instructions: >-
+        Only flag flaky selectors, missing awaits on Playwright actions,
+        and tests that would pass when they should fail.
+    - path: "ui/Containerfile"
+      instructions: >-
+        Flag security issues only: secrets in layers, running as root,
+        or missing OpenShift compatibility.
+    - path: "ui/deployment/**"
+      instructions: >-
+        Flag missing resource limits, privileged containers, and missing
+        security contexts.
+    - path: "ui/src/frontend/i18n/locales/*.json"
+      instructions: >-
+        Only flag keys missing from a locale, placeholders dropped in
+        translation, and copy left in English.
     - path: "deep_agent/**/*.py"
       instructions: >-
         Focus on correctness and performance: race conditions in async code,

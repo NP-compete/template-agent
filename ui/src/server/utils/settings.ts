@@ -539,7 +539,7 @@ function applyEnvOverrides(config: UISettings): void {
       config.security.session.same_site = sameSite as 'strict' | 'lax' | 'none';
     }
   }
-  
+
   // Platform OPA overrides
   if (process.env.PLATFORM_OPA_ENABLED !== undefined) {
     config.platform.opa.enabled = process.env.PLATFORM_OPA_ENABLED === "true";

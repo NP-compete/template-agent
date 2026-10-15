@@ -11,4 +11,3 @@ data:
   SSO_ISSUER_HOST: ""
   SSO_CALLBACK_URL: ""
   AGENT_HOST: "http://template-agent:8081"
-

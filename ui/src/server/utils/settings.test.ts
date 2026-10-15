@@ -80,7 +80,7 @@ agent:
       "Config file not found: /nonexistent/path/settings.yaml",
     );
   });
-  
+
   it("should throw when UI_CONFIG_PATH points to missing file in project dir", () => {
     process.env.UI_CONFIG_PATH = resolve(__dirname, "../../../config/ui/does-not-exist-xyz.yaml");
 

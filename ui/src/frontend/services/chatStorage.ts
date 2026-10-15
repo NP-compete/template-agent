@@ -23,7 +23,7 @@ class ChatStorageService {
       return true;
     } catch (error) {
       console.error('Error saving chats to localStorage:', error);
-      
+
       // If storage is full, try to reduce and save again
       try {
         const reducedChats = omitPrevProjectId(
@@ -40,7 +40,7 @@ class ChatStorageService {
   }
 
   saveChatByThreadId(threadId: string, messages: any[]): boolean {
-    
+
     const chats = this.loadChats();
     const threadIdChat = chats.find((chat) => chat.id === threadId);
     if (threadIdChat) {
@@ -68,7 +68,7 @@ class ChatStorageService {
       if (!storedChats) return [];
 
       const parsedChats: ChatItem[] = JSON.parse(storedChats);
-      
+
       // Validate and transform data
       return omitPrevProjectId(parsedChats)
         .filter(chat => chat.id && chat.title) // Filter invalid entries
@@ -106,7 +106,7 @@ class ChatStorageService {
     try {
       const chats = this.loadChats();
       const chatsData = localStorage.getItem(this.CHATS_STORAGE_KEY) || '';
-      
+
       return {
         used: chatsData.length,
         total: 5242880, // 5MB typical localStorage limit

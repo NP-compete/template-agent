@@ -122,7 +122,7 @@ async function routes(fastify: FastifyInstance) {
     request.session.redirectUri = redirect;
     return reply.redirect("/login");
   })
-  
+
   fastify.get("/mcp/oauth/callback", async (request: FastifyRequest, reply: FastifyReply) => {
     const cfg = getSettings();
     const agentHost = cfg.agent.endpoint || process.env.AGENT_HOST || "http://localhost:5002";
