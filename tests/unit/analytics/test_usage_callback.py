@@ -112,3 +112,71 @@ class TestOnLlmEnd:
                 _result(AIMessage(content="hi")), metadata={"run_id": "r2"}
             )
         record.assert_awaited_once_with("r2", None, 0, 0)
+
+
+class TestRunIdFromConfig:
+    """Where the Aegra run id actually comes from.
+
+    The previous version read `metadata["run_id"]`, on the strength
+    of LangChain copying scalar configurable values into callback
+    metadata. It does not — that copy feeds the LangSmith tracer —
+    and `on_llm_end` is passed no metadata at all, so the lookup
+    returned None for every call and every token was dropped.
+    """
+
+    def test_reads_the_run_id_from_the_active_config(self):
+        from deep_agent.src.analytics.usage_callback import _run_id_from_config
+
+        with patch(
+            "langgraph.config.get_config",
+            return_value={"configurable": {"run_id": "r1", "thread_id": "t1"}},
+        ):
+            assert _run_id_from_config() == "r1"
+
+    def test_none_outside_a_run(self):
+        from deep_agent.src.analytics.usage_callback import _run_id_from_config
+
+        with patch("langgraph.config.get_config", return_value={}):
+            assert _run_id_from_config() is None
+
+    def test_none_when_there_is_no_config_at_all(self):
+        from deep_agent.src.analytics.usage_callback import _run_id_from_config
+
+        with patch("langgraph.config.get_config", side_effect=RuntimeError("no run")):
+            assert _run_id_from_config() is None
+
+    @pytest.mark.asyncio
+    async def test_records_with_no_metadata_at_all(self):
+        # The shape every real call has: on_llm_end receives none.
+        message = AIMessage(
+            content="hi",
+            response_metadata={"model_name": "gemini-3.8-flash"},
+            usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+        )
+        record = AsyncMock()
+        with (
+            patch(
+                "langgraph.config.get_config",
+                return_value={"configurable": {"run_id": "r9"}},
+            ),
+            patch(
+                "deep_agent.src.analytics.usage_callback.record_llm_usage", new=record
+            ),
+        ):
+            await UsageRecorderCallbackHandler().on_llm_end(_result(message))
+
+        record.assert_awaited_once_with("r9", "gemini-3.8-flash", 7, 3)
+
+    @pytest.mark.asyncio
+    async def test_metadata_still_works_as_a_fallback(self):
+        record = AsyncMock()
+        with (
+            patch("langgraph.config.get_config", return_value={}),
+            patch(
+                "deep_agent.src.analytics.usage_callback.record_llm_usage", new=record
+            ),
+        ):
+            await UsageRecorderCallbackHandler().on_llm_end(
+                _result(), metadata={"run_id": "r2"}
+            )
+        record.assert_awaited_once()

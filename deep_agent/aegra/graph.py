@@ -528,6 +528,17 @@ async def agent(runtime: ServerRuntime) -> Any:
     # which is worse than silence. This is the same value
     # `get_mcp_tools` was given above, so the notice and the tool
     # list cannot disagree.
+    # Tokens per model call. A middleware rather than the LangChain
+    # callback this replaces: that one registered cleanly, said so in
+    # the log, and was never invoked for a single call the graph
+    # made, so every run recorded zero tokens while the Usage tab
+    # reported them as fact.
+    from deep_agent.src.analytics.usage_middleware import build_usage_middleware
+
+    usage_mw = build_usage_middleware()
+    if usage_mw is not None:
+        middleware.append(usage_mw)
+
     from deep_agent.src.self_knowledge.middleware import (
         build_self_knowledge_middleware,
     )

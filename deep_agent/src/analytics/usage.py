@@ -43,6 +43,12 @@ logger = get_python_logger()
 # One statement, so concurrent subagent calls serialise on the row lock
 # instead of racing. Every `execution_params` on the right-hand side is
 # the pre-update value.
+# Every parameter is cast explicitly. `model` is used as a
+# jsonb_build_object *key*, where Postgres cannot infer a type from
+# context and answers "could not determine data type of parameter
+# $3" — which `record_llm_usage` caught, logged at debug and
+# counted as a failure, so every write since this feature shipped
+# failed silently and the Usage tab reported zero tokens as fact.
 _RECORD_SQL = """
 UPDATE runs
 SET execution_params =
@@ -52,29 +58,29 @@ SET execution_params =
         || jsonb_build_object(
             'input_tokens',
                 COALESCE((execution_params #>> '{usage,input_tokens}')::bigint, 0)
-                + %(input_tokens)s,
+                + %(input_tokens)s::bigint,
             'output_tokens',
                 COALESCE((execution_params #>> '{usage,output_tokens}')::bigint, 0)
-                + %(output_tokens)s,
+                + %(output_tokens)s::bigint,
             'calls',
                 COALESCE((execution_params #>> '{usage,calls}')::bigint, 0) + 1,
             'models',
                 COALESCE(execution_params #> '{usage,models}', '{}'::jsonb)
-                || jsonb_build_object(%(model)s, jsonb_build_object(
+                || jsonb_build_object(%(model)s::text, jsonb_build_object(
                     'input_tokens',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'input_tokens')::bigint, 0)
-                        + %(input_tokens)s,
+                                  -> %(model)s::text ->> 'input_tokens')::bigint, 0)
+                        + %(input_tokens)s::bigint,
                     'output_tokens',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'output_tokens')::bigint, 0)
-                        + %(output_tokens)s,
+                                  -> %(model)s::text ->> 'output_tokens')::bigint, 0)
+                        + %(output_tokens)s::bigint,
                     'calls',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'calls')::bigint, 0) + 1
+                                  -> %(model)s::text ->> 'calls')::bigint, 0) + 1
                 ))
         ))
-WHERE run_id = %(run_id)s
+WHERE run_id = %(run_id)s::text
 """
 
 _pool: Any = None
@@ -142,9 +148,22 @@ async def record_llm_usage(
         async with pool.connection() as conn:
             await conn.execute(_RECORD_SQL, params)
         _failures = 0
-    except Exception:
+    except Exception as exc:
         _failures += 1
+        # The first failure is a warning, not a debug line. This
+        # write has no legitimate failure mode — it is one UPDATE on
+        # a pooled connection against a row that exists — so one
+        # failure already means something is wrong.
+        #
+        # It mattered: a type-inference error in the SQL made every
+        # write fail from the day the feature shipped. Each was
+        # caught here, logged at debug, and the counter reset on
+        # every pod restart, so the threshold never fired. The Usage
+        # tab reported zero tokens as fact for the life of the
+        # feature, and nothing anywhere said otherwise.
         if _failures >= _FAILURE_ALERT_THRESHOLD:
             logger.error("usage_recording_degraded", consecutive_failures=_failures)
         else:
-            logger.debug("Failed to record usage for run %s", run_id, exc_info=True)
+            logger.warning(
+                "Failed to record usage for run %s: %s", run_id, exc, exc_info=True
+            )

@@ -25,15 +25,35 @@ from deep_agent.utils.pylogger import get_python_logger
 logger = get_python_logger()
 
 
-def _run_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
-    """The Aegra run, not LangChain's per-call run.
+def _run_id_from_config() -> str | None:
+    """The Aegra run id, from the active LangGraph config.
 
-    ``create_run_config`` pins ``configurable.run_id``, and LangChain
-    copies scalar configurable values into callback metadata — so this
-    is the row in ``runs`` the tokens belong to. The ``run_id`` keyword
-    the callback also receives is the id of this single LLM call and
-    matches nothing in the database.
+    ``create_run_config`` pins ``configurable.run_id``, which is the
+    row in ``runs`` the tokens belong to. The ``run_id`` keyword the
+    callback receives is the id of this single LLM call and matches
+    nothing in the database.
+
+    Read from `langgraph.config`, as `token_budget.identity` does for
+    thread and user. The previous version read `metadata["run_id"]`
+    on the strength of LangChain copying scalar configurable values
+    into callback metadata. It does not: that copy is
+    `_get_langsmith_inheritable_metadata_from_config`, which feeds
+    the LangSmith tracer. And `on_llm_end` is passed no metadata at
+    all — so the lookup returned None for every call ever made, and
+    every token was dropped on the floor.
     """
+    try:
+        from langgraph.config import get_config
+
+        configurable = (get_config() or {}).get("configurable") or {}
+    except Exception:
+        return None
+    value = configurable.get("run_id")
+    return str(value) if value else None
+
+
+def _run_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+    """Fallback for callers that do pass metadata carrying the run id."""
     if not metadata:
         return None
     value = metadata.get("run_id")
@@ -70,7 +90,7 @@ class UsageRecorderCallbackHandler(AsyncCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Record token usage once the model call has finished."""
-        aegra_run_id = _run_id_from_metadata(metadata)
+        aegra_run_id = _run_id_from_config() or _run_id_from_metadata(metadata)
         if not aegra_run_id:
             # Evals, warmups and anything run outside a request have no
             # run row to attribute to. Not an error.
