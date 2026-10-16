@@ -509,23 +509,35 @@ async def agent(runtime: ServerRuntime) -> Any:
         mount = AttachmentsConfig().mount_path
     middleware.append(build_attachment_middleware(mount))
 
-    # Name the integrations that actually work. Every enabled MCP
-    # server contributes a tool whether or not anyone has connected
-    # to it, so without this the model cannot tell a usable
-    # integration from one that will answer "authorization
-    # required" — it picks one, fails, and has nothing useful to
-    # tell the user.
-    if mcp_tools:
-        from deep_agent.src.mcp_status.middleware import build_mcp_status_middleware
+    # Tell the agent what it is: the skills it can follow, who it can
+    # delegate to, which integrations are usable *right now*, and
+    # what its policy refuses. Every enabled MCP server contributes a
+    # tool whether or not anyone has connected to it, so without this
+    # the model cannot tell a usable integration from one that will
+    # answer "authorization required" — it picks one, fails, and has
+    # nothing useful to tell the user. The same is true of a tool its
+    # approval policy denies outright.
+    #
+    # One middleware, not two. The MCP notice used to be its own and
+    # left the model two descriptions of itself to reconcile.
+    #
+    # The identity is passed in, not discovered inside the
+    # middleware. The contextvar is not reliably set by the time a
+    # model call is wrapped, and resolving to the wrong user finds no
+    # tokens and reports everything as disconnected — confidently,
+    # which is worse than silence. This is the same value
+    # `get_mcp_tools` was given above, so the notice and the tool
+    # list cannot disagree.
+    from deep_agent.src.self_knowledge.middleware import (
+        build_self_knowledge_middleware,
+    )
 
-        # The identity is passed in, not discovered inside the
-        # middleware. The contextvar is not reliably set by the time
-        # a model call is wrapped, and resolving to the wrong user
-        # finds no tokens and reports everything as disconnected —
-        # confidently, which is worse than silence. This is the same
-        # value `get_mcp_tools` was given above, so the notice and
-        # the tool list cannot disagree.
-        middleware.append(build_mcp_status_middleware(user_identity))
+    self_knowledge = build_self_knowledge_middleware(
+        user_identity if mcp_tools else None,
+        model_name=str(model_name or ""),
+    )
+    if self_knowledge is not None:
+        middleware.append(self_knowledge)
 
     memory = resolve_memory_param(resolved_mw) if user_memory_enabled else None
 
