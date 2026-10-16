@@ -212,6 +212,18 @@ async def list_subagents() -> dict[str, Any]:
                 # prose.
                 "mcps": sorted(str(m) for m in (cfg.get("mcps") or [])),
                 "skills": sorted(str(s) for s in (cfg.get("skills") or [])),
+                # The enforced allow-list, not a hint. An explicit
+                # `tools:` is authoritative and is never widened with
+                # the rest of the declared servers' tools, so a
+                # subagent naming `mcps: [gitlab]` can still be
+                # confined to two of its tools — which the mcps list
+                # alone reads as the opposite of.
+                "tools": sorted(str(t) for t in (cfg.get("tools") or [])),
+                "tool_scope": (
+                    "explicit"
+                    if cfg.get("tools")
+                    else ("inherited" if cfg.get("mcps") else "none")
+                ),
             }
         )
     return {"subagents": out}
@@ -340,6 +352,38 @@ async def list_models() -> dict[str, Any]:
             }
         )
 
+    # A profile can strip tools or middleware for a given model, so
+    # a capability Skills still advertises can be quietly absent.
+    # Reported against the models above rather than as a list of
+    # profiles: the question is "what can *this* agent not do", not
+    # "what profiles exist".
+    profiles: dict[str, Any] = {}
+    try:
+        raw = agent_config.get_providers_config().harness_profiles
+        if isinstance(raw, dict):
+            profiles = raw
+    except Exception:
+        logger.debug("Could not read harness profiles", exc_info=True)
+
+    for entry in entries:
+        profile = profiles.get(entry["name"])
+        if profile is None:
+            continue
+        # Parsed models, not dicts — `get_raw_section` does not exist
+        # and the first version read nothing at all, which an
+        # `except Exception` turned into "no exclusions" rather than
+        # into an error.
+        excluded_tools = [
+            str(t) for t in (getattr(profile, "excluded_tools", None) or [])
+        ]
+        excluded_middleware = [
+            str(m) for m in (getattr(profile, "excluded_middleware", None) or [])
+        ]
+        if excluded_tools:
+            entry["excluded_tools"] = sorted(excluded_tools)
+        if excluded_middleware:
+            entry["excluded_middleware"] = sorted(excluded_middleware)
+
     routing: dict[str, Any] = {"enabled": False, "tiers": []}
     try:
         from deep_agent.src.routing.config import load_router_config
@@ -420,6 +464,91 @@ async def list_safeguards() -> dict[str, Any]:
         # for a config that names one.
         "guardrail": {"enabled": bool(getattr(guardrail, "enabled", False))},
         "token_budget": {"enabled": bool(getattr(budget, "enabled", False))},
+    }
+
+
+@router.get("/permissions")
+async def list_permissions() -> dict[str, Any]:
+    """What this agent is allowed to do.
+
+    Three rules decide whether an action happens, and none of them
+    were visible: whether a tool runs unattended, pauses for a
+    decision or is refused; whether the agent is in dry run and
+    therefore cannot act at all; and which paths it may read or
+    write.
+
+    Dry run is the one that most needs saying. Every tool that would
+    have asked is refused instead, so the agent investigates and
+    proposes and changes nothing — and from the outside that is
+    indistinguishable from an agent whose tools are broken.
+
+    Patterns and decisions only. No arguments, no paths outside the
+    configured roots, nothing about what has actually been run.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    def _read(fn: str) -> Any:
+        try:
+            return getattr(agent_config, fn)()
+        except Exception:
+            logger.debug("Could not read config via %s", fn, exc_info=True)
+            return None
+
+    middleware = _read("get_middleware_config")
+    approval = getattr(getattr(middleware, "defaults", None), "human_approval", None)
+    filesystem = _read("get_filesystem_config")
+
+    # admin_routes already resolves this, including the fallback for
+    # an invalid block. A second copy here is how the two come to
+    # disagree about whether the agent can act.
+    from deep_agent.aegra.admin_routes import _effects_mode
+
+    try:
+        effects = _effects_mode()
+    except Exception:
+        logger.debug("Could not read the effects mode", exc_info=True)
+        effects = "live"
+
+    policies = [
+        {
+            "tools": sorted(str(t) for t in (getattr(policy, "tools", None) or [])),
+            "decision": str(getattr(policy, "decision", "ask")),
+            "risk": str(getattr(policy, "risk", "medium")),
+            "reason": str(getattr(policy, "reason", "") or ""),
+        }
+        for policy in (getattr(approval, "policies", None) or [])
+    ]
+
+    # `exclude` predates policies and still means "never prompt".
+    # Presented as what it is rather than as a separate concept
+    # nobody reading the page would know to ask about.
+    never_asks = sorted(str(p) for p in (getattr(approval, "exclude", None) or []))
+
+    rules = []
+    for rule in getattr(filesystem, "permissions", None) or []:
+        rules.append(
+            {
+                "operations": sorted(
+                    str(o) for o in (getattr(rule, "operations", None) or [])
+                ),
+                "paths": sorted(str(p) for p in (getattr(rule, "paths", None) or [])),
+                "mode": str(getattr(rule, "mode", "") or ""),
+            }
+        )
+
+    return {
+        "approval": {
+            "enabled": bool(getattr(approval, "enabled", True)),
+            "default_decision": str(getattr(approval, "default_decision", "ask")),
+            "policies": policies,
+            "never_asks": never_asks,
+        },
+        # Flat rather than nested under approval: dry run is enforced
+        # through the approval policy but it is not an approval
+        # setting, and burying it reads as a detail of one.
+        "effects": effects,
+        "dry_run": effects == "dry_run",
+        "filesystem": {"rules": rules},
     }
 
 

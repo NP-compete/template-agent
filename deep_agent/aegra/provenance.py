@@ -74,7 +74,7 @@ def describe_message(msg: Any) -> dict[str, Any]:
     # Recorded by middleware onto the message it produced. Absent
     # means the feature is off or did not fire, which is why these
     # are read rather than defaulted.
-    for key in ("routed_tier", "routed_by", "fallback_from", "cached"):
+    for key in ("routed_tier", "routed_by", "fallback_from", "cached", "pii_scrubbed"):
         value = extra.get(key)
         if value not in (None, "", False):
             out[key] = value

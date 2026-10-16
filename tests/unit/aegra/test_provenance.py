@@ -112,3 +112,15 @@ class TestShape:
             )
             == {}
         )
+
+
+class TestPiiAnnotation:
+    def test_reports_that_a_substitution_happened(self):
+        # The restored text reads exactly like the original, so
+        # without this the fact that the model saw something else is
+        # unrecoverable.
+        out = describe_message(_msg(extra={"pii_scrubbed": 3}))
+        assert out["pii_scrubbed"] == 3
+
+    def test_absent_when_nothing_was_scrubbed(self):
+        assert "pii_scrubbed" not in describe_message(_msg(extra={}))

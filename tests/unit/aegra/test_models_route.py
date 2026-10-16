@@ -7,6 +7,7 @@ checks when an answer looks wrong.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -127,3 +128,55 @@ class TestListModels:
         flat = str(body)
         for leak in ("http://", "https://", "project", "credential", "api_key"):
             assert leak not in flat.lower()
+
+
+class TestHarnessProfileExclusions:
+    """A profile can remove a tool for a given model.
+
+    Skills still advertises the capability, so the absence is
+    invisible unless it is reported against the model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reports_excluded_tools_for_the_model_that_loses_them(self):
+        cfg = _config("gemini-3.8-flash")
+        cfg.get_providers_config.return_value = SimpleNamespace(
+            harness_profiles={
+                "gemini-3.8-flash": SimpleNamespace(
+                    excluded_tools=["write_file", "shell"],
+                    excluded_middleware=["pii"],
+                )
+            }
+        )
+        with patch("deep_agent.src.agent.config.agent_config", cfg):
+            body = await sr.list_models()
+
+        orchestrator = body["models"][0]
+        assert orchestrator["excluded_tools"] == ["shell", "write_file"]
+        assert orchestrator["excluded_middleware"] == ["pii"]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_profile_adds_nothing(self):
+        # Absent, not an empty list: the UI shows the line only when
+        # something is actually missing.
+        cfg = _config("gemini-3.8-flash")
+        cfg.get_providers_config.return_value = SimpleNamespace(
+            harness_profiles={
+                "gemini-3.8-flash": SimpleNamespace(
+                    excluded_tools=[], excluded_middleware=[]
+                )
+            }
+        )
+        with patch("deep_agent.src.agent.config.agent_config", cfg):
+            body = await sr.list_models()
+
+        assert "excluded_tools" not in body["models"][0]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_profiles_cost_the_detail_not_the_route(self):
+        cfg = _config("gemini-3.8-flash")
+        cfg.get_providers_config.side_effect = RuntimeError("bad yaml")
+        with patch("deep_agent.src.agent.config.agent_config", cfg):
+            body = await sr.list_models()
+
+        assert body["models"][0]["name"] == "gemini-3.8-flash"
