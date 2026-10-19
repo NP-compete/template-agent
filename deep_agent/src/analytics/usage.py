@@ -85,6 +85,9 @@ _pool_lock = asyncio.Lock()
 # only visible if we count them.
 _failures = 0
 _FAILURE_ALERT_THRESHOLD = 5
+# Accounting must never be the slowest thing in a turn.
+_ACQUIRE_TIMEOUT_SECONDS = 2.0
+_WRITE_TIMEOUT_SECONDS = 5.0
 
 
 async def _get_pool() -> Any:
@@ -139,8 +142,17 @@ async def record_llm_usage(
     }
     try:
         pool = await _get_pool()
-        async with pool.connection() as conn:
-            await conn.execute(_RECORD_SQL, params)
+        # Bounded wait for a connection, and for the write.
+        #
+        # This is awaited inline on every model call, and the pool
+        # holds at most four connections with psycopg_pool's default
+        # 30-second acquire timeout. A database that is unreachable or
+        # merely busy therefore added up to 30 seconds to each LLM
+        # call — the opposite of best-effort. Usage accounting is
+        # worth losing; a turn is not.
+        async with asyncio.timeout(_WRITE_TIMEOUT_SECONDS):
+            async with pool.connection(timeout=_ACQUIRE_TIMEOUT_SECONDS) as conn:
+                await conn.execute(_RECORD_SQL, params)
         _failures = 0
     except Exception:
         _failures += 1

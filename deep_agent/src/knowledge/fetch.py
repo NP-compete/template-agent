@@ -47,8 +47,12 @@ def _is_blocked(address: str) -> bool:
     return not ip.is_global
 
 
-def assert_safe_url(url: str) -> None:
-    """Reject anything that is not plain HTTP(S) to a public address."""
+def assert_safe_url(url: str) -> list[str]:
+    """Reject anything that is not plain HTTP(S) to a public address.
+
+    Returns the validated addresses so the caller can connect to one
+    of them rather than resolving the name a second time.
+    """
     parsed = urlparse(url)
 
     if parsed.scheme not in ("http", "https"):
@@ -66,6 +70,7 @@ def assert_safe_url(url: str) -> None:
     except socket.gaierror as exc:
         raise UnsafeURLError(f"Could not resolve {parsed.hostname}") from exc
 
+    addresses: list[str] = []
     for info in infos:
         # sockaddr is (host, port) for IPv4 and (host, port, flow, scope)
         # for IPv6, so the element is typed `str | int` even though the
@@ -75,6 +80,8 @@ def assert_safe_url(url: str) -> None:
             raise UnsafeURLError(
                 f"{parsed.hostname} resolves to a non-public address and will not be fetched"
             )
+        addresses.append(address)
+    return addresses
 
 
 def fetch_url(url: str) -> tuple[str, str]:
@@ -86,27 +93,57 @@ def fetch_url(url: str) -> tuple[str, str]:
     """
     current = url
     for _ in range(MAX_REDIRECTS + 1):
-        assert_safe_url(current)
+        addresses = assert_safe_url(current)
+
+        # Connect to the address that was checked, not to whatever the
+        # name resolves to next.
+        #
+        # `assert_safe_url` resolves once and httpx used to resolve
+        # again on its own, so a host that answers with a public
+        # address for the first lookup and 169.254.169.254 for the
+        # second passed the check and was then fetched anyway. The
+        # address goes in the URL; `Host` and the TLS SNI keep the
+        # original name, so virtual hosting and certificate
+        # verification both still work.
+        parsed = httpx.URL(current)
+        hostname = parsed.host
+        pinned = parsed.copy_with(host=addresses[0])
 
         with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False) as client:
-            response = client.get(current, headers={"User-Agent": "template-agent/1.0"})
+            with client.stream(
+                "GET",
+                pinned,
+                headers={"User-Agent": "template-agent/1.0", "Host": hostname},
+                extensions={"sni_hostname": hostname},
+            ) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise UnsafeURLError("Redirect without a location")
+                    current = str(httpx.URL(current).join(location))
+                    continue
 
-        if response.is_redirect:
-            location = response.headers.get("location")
-            if not location:
-                raise UnsafeURLError("Redirect without a location")
-            current = str(httpx.URL(current).join(location))
-            continue
+                response.raise_for_status()
 
-        response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "html" not in content_type and "text" not in content_type:
+                    raise UnsafeURLError(
+                        f"Unsupported content type: {content_type or 'unknown'}"
+                    )
 
-        content_type = response.headers.get("content-type", "")
-        if "html" not in content_type and "text" not in content_type:
-            raise UnsafeURLError(
-                f"Unsupported content type: {content_type or 'unknown'}"
-            )
+                # Read to the cap and stop. `response.content` buffered
+                # the whole body first and truncated afterwards, so a
+                # server that never stops sending could exhaust memory
+                # before the slice ever ran.
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= MAX_BYTES:
+                        break
+                body = b"".join(chunks)[:MAX_BYTES]
 
-        body = response.content[:MAX_BYTES]
         return _html_to_text(body.decode("utf-8", errors="replace"), current)
 
     raise UnsafeURLError("Too many redirects")

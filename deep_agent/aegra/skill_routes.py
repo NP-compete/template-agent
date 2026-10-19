@@ -283,8 +283,13 @@ async def whoami(request: Request) -> dict[str, Any]:
     if not ENABLE_AUTH:
         return {"user_id": user_id, "role": "owners", "is_developer": True}
 
+    # Resolved against `preferred_username`, not the `sub` returned
+    # above: LDAP has never heard of the UUID, so looking it up
+    # reported every developer as an ordinary user.
+    from deep_agent.aegra.auth_helpers import role_identity
+
     try:
-        role = await resolve_user_role(user_id)
+        role = await resolve_user_role(await role_identity(request) or user_id)
     except Exception:
         logger.debug("Could not resolve role for %s", user_id, exc_info=True)
         role = None

@@ -110,13 +110,13 @@ def _opa_summary() -> dict[str, Any]:
 
 
 def _effects_mode() -> str:
-    """The configured effects axis, defaulting to live."""
-    from deep_agent.src.agent.config import agent_config
-    from deep_agent.src.agent.config.middleware import ExecutionConfig
+    """The configured effects axis, defaulting to live.
 
-    raw = agent_config.get_orchestrator_config().get("execution") or {}
-    try:
-        return ExecutionConfig(**raw).effects
-    except Exception:
-        logger.warning("Invalid execution config; assuming effects=live")
-        return "live"
+    Asks the loader rather than re-reading config here. This used to
+    look in the PROMPT.md frontmatter while `agent.yaml` writes
+    `execution:` at the top level, so it always answered "live" — and
+    reported "live" for a deployment configured as a dry run.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    return agent_config.get_effects_mode()

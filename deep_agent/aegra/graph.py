@@ -121,8 +121,16 @@ def _graph_fingerprint(
     max_tokens: int | None = None,
     mcp_names: list[str] | None = None,
     resource_uris: list[str] | None = None,
+    user_identity: str = "",
 ) -> str:
-    """Stable fingerprint for graph cache keying."""
+    """Stable fingerprint for graph cache keying.
+
+    `user_identity` is part of the key because the compiled graph
+    holds middleware built for one person: the MCP status middleware
+    closes over a user id and reports which integrations *they* have
+    connected. Shared under a key that omitted the user, the second
+    person to ask got the first person's connection state.
+    """
     hitl_flag = (
         f"hitl={int(hitl_enabled)}"
         f",mode={hitl_mode}"
@@ -134,6 +142,7 @@ def _graph_fingerprint(
     raw = (
         f"{model_name}\0{system_prompt}\0{','.join(sorted(tool_names))}"
         f"\0{hitl_flag}\0{model_flag}\0{mcp_flag}\0{resources_flag}"
+        f"\0user={user_identity}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -460,6 +469,9 @@ async def agent(runtime: ServerRuntime) -> Any:
         system_prompt = _append_memory_instructions(system_prompt)
 
     hitl = getattr(resolved_mw, "human_approval", None)
+    # Read once, from the top level of agent.yaml, and used both to
+    # drop denied tools and to build the approval map.
+    effects_mode = agent_config.get_effects_mode()
 
     cache_key = _graph_fingerprint(
         model_name,
@@ -472,6 +484,7 @@ async def agent(runtime: ServerRuntime) -> Any:
         max_tokens=int(orch_max_tokens) if orch_max_tokens else None,
         mcp_names=mcp_server_names or None,
         resource_uris=orchestrator_cfg.get("resources") or None,
+        user_identity=str(user_identity or ""),
     )
     now = time.time()
     graph_ttl = float(agent_config.get_cache_config().graph.ttl)
@@ -576,11 +589,32 @@ async def agent(runtime: ServerRuntime) -> Any:
         except (ImportError, TypeError):
             pass
 
+    # A denied tool is removed, not merely un-approved.
+    #
+    # `build_interrupt_on` recorded the denials and returned only the
+    # interrupt map, and this call passed no `effects` — so a tool the
+    # policy refuses outright stayed in the model's hands and ran
+    # without ever reaching an approval prompt, and `effects: dry_run`
+    # did nothing at all. Both axes are applied here now, before the
+    # tool list reaches the agent.
+    if hitl and hitl.enabled:
+        from deep_agent.src.agent.config.hitl import denied_tool_names
+
+        denied = denied_tool_names(hitl, tools, effects=effects_mode)
+        if denied:
+            logger.warning(
+                "Removing %d tool(s) denied by approval policy (effects=%s): %s",
+                len(denied),
+                effects_mode,
+                sorted(denied),
+            )
+            tools = [t for t in tools if getattr(t, "name", None) not in denied]
+
     if hitl and hitl.enabled and "interrupt_on" in create_sig.parameters:
         try:
             from deep_agent.src.agent.config.hitl import build_interrupt_on
 
-            interrupt_on = build_interrupt_on(hitl, tools)
+            interrupt_on = build_interrupt_on(hitl, tools, effects=effects_mode)
             if interrupt_on:
                 create_kwargs["interrupt_on"] = interrupt_on
             else:

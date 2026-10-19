@@ -341,6 +341,21 @@ class AgentConfig:
             raw.get("token_budget", {})
         )
 
+        # Extract the execution axis. Top level, which is where
+        # `validate.py` checks it and where agent.yaml writes it —
+        # the only reader looked in the PROMPT.md frontmatter instead
+        # and therefore always saw "live", so a configured dry run
+        # ran for real while the admin endpoint reported it as live.
+        from deep_agent.src.agent.config.middleware import ExecutionConfig
+
+        try:
+            self._execution_config = ExecutionConfig.model_validate(
+                raw.get("execution") or {}
+            )
+        except Exception:
+            logger.warning("Invalid execution config; assuming effects=live")
+            self._execution_config = ExecutionConfig()
+
         # Extract top-level identity
         self._name = raw.get("name", "Agent")
         # Scan skills first, as orchestrator and subagents need them for resolution
@@ -372,6 +387,25 @@ class AgentConfig:
             resolved = config_file(name)
             if resolved is not None:
                 return resolved
+            return self._base_dir / fallback
+
+        # A base dir of its own still gets the full candidate list.
+        #
+        # This branch used to return `self._base_dir / fallback` and
+        # nothing else. `_load_mcp_servers` passes "mcp.json" as the
+        # fallback while the shipped file is `integrations/mcp.json`,
+        # so an agent pointed at any directory other than CONFIG_PATH
+        # found no MCP servers at all and said nothing about it.
+        from deep_agent.src.agent.config.paths import candidates_for
+
+        try:
+            options = candidates_for(name)
+        except KeyError:
+            options = ()
+        for candidate in options:
+            path = self._base_dir / candidate
+            if path.exists():
+                return path
         return self._base_dir / fallback
 
     @property
@@ -815,6 +849,15 @@ class AgentConfig:
         """Get the pre-loaded per-thread token budget configuration."""
         self._ensure_loaded()
         return self._token_budget_config
+
+    def get_effects_mode(self) -> str:
+        """Whether this deployment may actually change anything.
+
+        One reader, so the graph that enforces it and the endpoint
+        that reports it cannot disagree.
+        """
+        self._ensure_loaded()
+        return str(self._execution_config.effects)
 
     def get_name(self) -> str:
         """Get the agent display name from config.

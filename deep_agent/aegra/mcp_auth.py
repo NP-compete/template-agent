@@ -469,9 +469,39 @@ class McpCredentialResolver:
         if auth_mode == "dcr":
             current_agent_name = settings.agent_deployment_id
             client = await self._store.get_client(current_agent_name, mcp_name)
-            if client is None:
+            if client is not None:
+                # A registered client is the more specific grant.
+                return client.client_id, client.client_secret
+
+            # No record does not mean no client.
+            #
+            # A CIMD server never registers us: the client_id *is*
+            # this agent's metadata URL, and the authorize path knows
+            # that while this one did not. So every refresh against
+            # such a server failed with "client_id unavailable", and
+            # the connection had to be made again by hand the first
+            # time its access token expired — five minutes, for the
+            # servers that prompted this.
+            from deep_agent.aegra.mcp_oauth_handlers import resolve_oauth_config
+
+            try:
+                oauth = await resolve_oauth_config(mcp_name, server_cfg)
+            except Exception:
+                logger.debug(
+                    "[%s] could not resolve OAuth config for client lookup",
+                    mcp_name,
+                    exc_info=True,
+                )
                 return None, None
-            return client.client_id, client.client_secret
+
+            if oauth.get("client_id_metadata_document_supported") and not oauth.get(
+                "registration_endpoint"
+            ):
+                return (
+                    f"{settings.agent_public_base_url}/.well-known/oauth-client",
+                    None,
+                )
+            return None, None
 
         return None, None
 

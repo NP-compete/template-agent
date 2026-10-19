@@ -231,6 +231,14 @@ class Settings(BaseSettings):
     LIFECYCLE_LEASE_SECONDS: int = Field(default=300)
     LIFECYCLE_MAX_RESUME_BATCH: int = Field(default=10)
     LIFECYCLE_RESUME_ON_STARTUP: bool = Field(default=True)
+    # How often to re-check for interrupted runs after startup, and how
+    # old one must be before the sweep touches it. Startup alone is not
+    # enough: a pod shutting down marks its runs interrupted, and when
+    # that lands after the replacement's startup scan nothing looks
+    # again until the next restart — the thread stays "busy" in the
+    # sidebar for ever. Zero disables the sweep.
+    LIFECYCLE_SWEEP_INTERVAL_SECONDS: int = Field(default=60, ge=0)
+    LIFECYCLE_SWEEP_MIN_AGE_SECONDS: int = Field(default=45, ge=0)
 
     # ── OPA (Authorization) ───────────────────────────────────────────
     # None = not set; agent.yaml opa: section is the source of truth.

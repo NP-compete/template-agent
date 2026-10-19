@@ -872,8 +872,16 @@ async def get_mcp_tools(
         revalidate_key: str = cache_key
 
         async def _revalidate(key: str = revalidate_key) -> None:
+            # The old timestamp stays until the new list replaces it.
+            #
+            # Popping it first made the entry look *absent* rather than
+            # stale for the whole refresh: the stale branch was shut
+            # out by `_refreshing`, the fresh branch by a zero
+            # timestamp, so every request arriving during the window
+            # fell through to a full rebuild of its own — 27 seconds
+            # each, in parallel, to recompute what one background task
+            # was already fetching.
             try:
-                _cached_tools_ts.pop(key, None)
                 await get_mcp_tools(
                     sso_token=sso_token, server_names=server_names, user_id=user_id
                 )

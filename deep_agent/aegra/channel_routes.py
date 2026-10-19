@@ -16,6 +16,7 @@ The ordering in :func:`receive` is deliberate and worth preserving:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from typing import Any
@@ -42,6 +43,29 @@ def _load_channels() -> dict[str, ChannelConfig]:
     from deep_agent.src.channels.loader import load_channels
 
     return load_channels().active()
+
+
+def _delivery_key(request: Request, body: bytes) -> str:
+    """A stable id for this exact delivery, for payloads carrying none.
+
+    Slack sends an `event_id` and the dedup window keys on it. A plain
+    webhook sends nothing of the sort, so the key was empty, dedup was
+    skipped entirely, and one captured signed request could be
+    replayed for the whole freshness window — a new run each time.
+
+    The signature is already unique per delivery (it covers the
+    timestamp and the body), so it is the natural key. Hashed rather
+    than stored, because it is a credential.
+    """
+    signature = request.headers.get("X-Slack-Signature") or request.headers.get(
+        "X-Signature", ""
+    )
+    if signature:
+        return "sig:" + hashlib.sha256(signature.encode()).hexdigest()
+    timestamp = request.headers.get("X-Slack-Request-Timestamp") or request.headers.get(
+        "X-Timestamp", ""
+    )
+    return "body:" + hashlib.sha256(timestamp.encode() + b"\0" + body).hexdigest()
 
 
 def _verify(channel: ChannelConfig, request: Request, body: bytes) -> None:
@@ -130,7 +154,7 @@ async def receive(name: str, request: Request) -> Response:
         # Something we deliberately ignore, like a bot's own post.
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    event_key = message.metadata.get("event_id") or ""
+    event_key = message.metadata.get("event_id") or _delivery_key(request, body)
     if already_handled(event_key):
         logger.info("Ignoring duplicate delivery of %s", event_key)
         return Response(status_code=status.HTTP_204_NO_CONTENT)

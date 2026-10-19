@@ -34,6 +34,8 @@ from deep_agent.utils.pylogger import get_python_logger
 logger = get_python_logger()
 
 _startup_complete = False
+# Strong references to background tasks; asyncio keeps only weak ones.
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
 async def run_startup() -> dict[str, str]:
@@ -61,16 +63,28 @@ async def run_startup() -> dict[str, str]:
     results["otel"] = _setup_otel()
     results["telemetry"] = _setup_telemetry()
     results["graph_warmup"] = _warmup_graph_imports()
+
+    # Marked done *before* the graph is built, not after.
+    #
+    # `_warm_graph` calls `agent()`, which calls `_ensure_startup()`,
+    # which called `run_startup()` again because this flag was still
+    # False — and each nesting repeated the database init, the
+    # interrupted-run resume, the cache warm and another graph build.
+    # Measured on a live pod: 224 startups per boot, each one slower
+    # than the last. Everything above this line is the part that must
+    # not run twice; everything below is safe to re-enter.
+    _startup_complete = True
+
     # Separate from the cache step on purpose: that one returns early
     # when CACHE_ENABLED is false, and building the graph is worth doing
     # whether or not the model cache is on.
     results["graph_build"] = await _warm_graph()
     results["inflight_metrics"] = _start_inflight_metrics()
+    results["run_sweeper"] = _start_interrupted_run_sweeper()
 
     _upgrade_signal_handlers()
 
     elapsed = round((time.monotonic() - t0) * 1000, 1)
-    _startup_complete = True
 
     logger.info(
         "Startup complete in %.1fms: %s",
@@ -222,8 +236,13 @@ async def _clear_input_for_checkpoint_resume(
     return updated
 
 
-async def _resume_interrupted_runs() -> str:
+async def _resume_interrupted_runs(min_age_seconds: int = 0) -> str:
     """Reset interrupted runs so Aegra's LeaseReaper can recover them.
+
+    ``min_age_seconds`` leaves very recent ones alone, so the periodic
+    sweep does not grab a run a pod is still in the middle of shutting
+    down. Startup passes zero: anything interrupted then is by
+    definition from a process that is already gone.
 
     Aegra's own shutdown may mark active runs as ``interrupted``
     (via executor.stop), but the LeaseReaper only scans for
@@ -249,8 +268,9 @@ async def _resume_interrupted_runs() -> str:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT run_id FROM runs WHERE status = 'interrupted' "
+                    "AND updated_at < NOW() - make_interval(secs => %s) "
                     "ORDER BY updated_at ASC LIMIT %s",
-                    (app_settings.LIFECYCLE_MAX_RESUME_BATCH,),
+                    (min_age_seconds, app_settings.LIFECYCLE_MAX_RESUME_BATCH),
                 )
                 recovered_run_ids = [row[0] for row in await cur.fetchall()]
 
@@ -303,6 +323,49 @@ async def _resume_interrupted_runs() -> str:
     except Exception as exc:
         logger.warning("Resume check failed: %s", exc)
         return f"warning: {exc}"
+
+
+def _start_interrupted_run_sweeper() -> str:
+    """Re-check for interrupted runs periodically, not only at boot.
+
+    `_resume_interrupted_runs` runs once, during startup. A pod
+    shutting down marks its in-flight runs `interrupted`, and when
+    that write lands *after* the replacement pod has already scanned,
+    nothing looks again until the next restart. Observed on a rolling
+    update: the new pods scanned at 09:53:55 and 09:54:15, the old
+    ones marked five runs interrupted at 09:54:31, and two threads sat
+    "busy" in the sidebar with no one coming for them.
+    """
+    from deep_agent.src.settings import settings as app_settings
+
+    interval = app_settings.LIFECYCLE_SWEEP_INTERVAL_SECONDS
+    if not app_settings.LIFECYCLE_PERSISTENCE_ENABLED:
+        return "skipped: lifecycle persistence disabled"
+    if interval <= 0:
+        return "skipped: sweep disabled"
+
+    async def _sweep() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                result = await _resume_interrupted_runs(
+                    min_age_seconds=app_settings.LIFECYCLE_SWEEP_MIN_AGE_SECONDS
+                )
+                if not result.startswith("ok: no recoverable"):
+                    logger.info("Interrupted-run sweep: %s", result)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Interrupted-run sweep failed", exc_info=True)
+
+    try:
+        task = asyncio.create_task(_sweep())
+        # Held so the task is not garbage collected mid-flight.
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+    except RuntimeError:
+        return "skipped: no running loop"
+    return f"ok: every {interval}s"
 
 
 async def _validate_config() -> str:

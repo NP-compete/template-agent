@@ -184,10 +184,27 @@ async def _deliver_slack(reply: str, message: InboundMessage) -> None:
 
 
 async def _deliver_webhook(reply: str, message: InboundMessage) -> None:
+    """POST the reply to the sender's callback URL.
+
+    The URL comes from the request body, so it is checked the same way
+    a URL the agent was asked to read is checked. Without this, any
+    sender mapped to a channel could name a cluster service or the
+    instance metadata endpoint and have the agent POST to it —
+    reachable from inside the pod and not from where the sender sits.
+    """
+    from deep_agent.src.knowledge.fetch import UnsafeURLError, assert_safe_url
+
+    url = str(message.reply_to)
+    try:
+        await asyncio.to_thread(assert_safe_url, url)
+    except UnsafeURLError as exc:
+        logger.warning("Refusing callback to %s: %s", url, exc)
+        return
+
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             await client.post(
-                str(message.reply_to),
+                url,
                 json={"conversation": message.conversation, "text": reply},
             )
         except httpx.HTTPError as exc:

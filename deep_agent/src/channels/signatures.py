@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import time
 from dataclasses import dataclass
 
@@ -42,6 +43,13 @@ def _fresh(timestamp: str, max_age_seconds: int, now: float) -> VerificationResu
         sent_at = float(timestamp)
     except (TypeError, ValueError):
         return VerificationResult(False, "timestamp is not a number")
+
+    # `float()` accepts "nan", "inf" and "-inf". Every comparison
+    # against NaN is False, so a NaN timestamp fell through both
+    # bounds below and was reported fresh — which removes the replay
+    # window entirely for anyone who captures one signed request.
+    if not math.isfinite(sent_at):
+        return VerificationResult(False, "timestamp is not a finite number")
 
     age = now - sent_at
     if age > max_age_seconds:

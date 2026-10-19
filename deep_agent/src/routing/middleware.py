@@ -22,6 +22,25 @@ logger = get_python_logger()
 # "first_message" routing survives subsequent turns.
 STATE_KEY = "_routed_tier"
 
+# Thread id -> tier, for `strategy: first_message`.
+#
+# In-process and bounded: losing it on restart costs one extra
+# classification for a live thread, which is the behaviour this
+# replaces rather than a regression.
+_ROUTED_TIERS: dict[str, str] = {}
+_ROUTED_TIERS_LIMIT = 2048
+
+
+def _thread_id() -> str:
+    """The current thread, or "" when there is no graph context."""
+    try:
+        from langgraph.config import get_config
+
+        config = get_config() or {}
+        return str((config.get("configurable") or {}).get("thread_id") or "")
+    except Exception:
+        return ""
+
 
 def _first_human_text(messages: list[Any]) -> str:
     """The text that routing is decided on."""
@@ -93,7 +112,10 @@ def build_model_router_middleware(
         state = getattr(request, "state", None) or {}
         messages = list(getattr(request, "messages", []) or [])
 
+        thread = _thread_id()
         remembered = state.get(STATE_KEY) if isinstance(state, dict) else None
+        if not remembered and thread:
+            remembered = _ROUTED_TIERS.get(thread)
 
         if cfg.strategy == "first_message" and remembered:
             # Keep the thread on one model: switching mid-thread discards
@@ -111,6 +133,20 @@ def build_model_router_middleware(
             reason, method = decision.reason, decision.method
 
             logger.info("Routed to tier '%s' (%s: %s)", chosen_name, method, reason)
+
+            # Remember it, so "first_message" means the first message.
+            #
+            # Nothing wrote `STATE_KEY`, so `remembered` was always
+            # empty and the sticky branch never ran: every model call
+            # in the thread re-applied the rules and, where they did
+            # not match, paid for another classifier call. This
+            # middleware wraps the model call and cannot write graph
+            # state, so the thread is the key here instead.
+            if thread and cfg.strategy == "first_message":
+                if len(_ROUTED_TIERS) >= _ROUTED_TIERS_LIMIT:
+                    for stale in list(_ROUTED_TIERS)[: _ROUTED_TIERS_LIMIT // 2]:
+                        _ROUTED_TIERS.pop(stale, None)
+                _ROUTED_TIERS[thread] = chosen_name
 
         client = _client_for(chosen_name)
         if client is None:

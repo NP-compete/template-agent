@@ -62,6 +62,7 @@ def transcribe(filename: str, data: bytes, model_name: str) -> str:
     # it first only moves the error somewhere less relevant.
     #
     # Small enough to inline, or large enough to need an upload first.
+    uploaded_uri: str | None = None
     if len(data) > MAX_INLINE_BYTES:
         from deep_agent.src.knowledge.media_upload import (
             MediaUploadError,
@@ -72,6 +73,7 @@ def transcribe(filename: str, data: bytes, model_name: str) -> str:
             uri = upload_media(filename, data)
         except MediaUploadError as exc:
             raise TranscriptionUnavailable(str(exc)) from exc
+        uploaded_uri = uri
         media_block: dict = {"type": "media", "file_uri": uri, "mime_type": mime}
         logger.info("Transcribing %s via uploaded file %s", filename, uri)
     else:
@@ -102,12 +104,23 @@ def transcribe(filename: str, data: bytes, model_name: str) -> str:
     )
 
     try:
-        result = model.invoke([message])
+        # Bounded: `_TIMEOUT_SECONDS` existed and nothing passed it, so
+        # a model that never answered held the request open for ever.
+        result = model.invoke([message], timeout=_TIMEOUT_SECONDS)
     except Exception as exc:
         logger.warning("Transcription failed for %s: %s", filename, exc)
         raise TranscriptionUnavailable(
             f"{filename}: could not be transcribed ({type(exc).__name__})"
         ) from exc
+    finally:
+        # The recording is the user's, and it was only uploaded so the
+        # model could read it. Nothing deleted it afterwards, so every
+        # one stayed in the bucket until a lifecycle rule caught up —
+        # and a bucket without such a rule kept them indefinitely.
+        if uploaded_uri:
+            from deep_agent.src.knowledge.media_upload import delete_media
+
+            delete_media(uploaded_uri)
 
     content = result.content
     if isinstance(content, list):

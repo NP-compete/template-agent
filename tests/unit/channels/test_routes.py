@@ -24,6 +24,21 @@ from deep_agent.src.channels.signatures import sign_webhook
 SECRET = "s3cr3t"
 
 
+@pytest.fixture(autouse=True)
+def _forget_deliveries():
+    """Replay protection is process-wide; these tests are not.
+
+    A webhook with no `event_id` is now deduplicated on its signature,
+    and every test here posts the same body with the same secret — so
+    the second test to do so was answered as a replay and never ran.
+    """
+    from deep_agent.src.channels.dispatch import _SEEN_EVENTS
+
+    _SEEN_EVENTS.clear()
+    yield
+    _SEEN_EVENTS.clear()
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("WEBHOOK_SIGNING_SECRET", SECRET)
@@ -144,3 +159,43 @@ class TestDisabledByDefault:
             app = FastAPI()
             app.include_router(router)
             assert TestClient(app).post("/channels/webhook", json={}).status_code == 404
+
+
+class TestReplayProtection:
+    """A signed webhook must not be replayable inside its freshness window.
+
+    Slack carries an `event_id` and the dedup window keys on it. A
+    plain webhook carries nothing of the sort, so the key was empty,
+    `already_handled("")` answered False every time, and one captured
+    request could be resent until the timestamp went stale — starting
+    a fresh run on each delivery.
+    """
+
+    def test_the_same_signed_delivery_runs_once(self, client):
+        runs = []
+
+        async def capture(message, channel, user_id):
+            runs.append(user_id)
+
+        body = {"sender": "ci", "text": "hello"}
+        with patch("deep_agent.aegra.channel_routes._run_and_deliver", new=capture):
+            # No explicit timestamp: a fixed one in the past fails the
+            # freshness check before dedup is ever reached.
+            first = post(client, body)
+            second = post(client, body)
+
+        assert first.status_code == 202
+        assert second.status_code == 204
+        assert len(runs) == 1
+
+    def test_a_different_message_still_runs(self, client):
+        runs = []
+
+        async def capture(message, channel, user_id):
+            runs.append(message.text)
+
+        with patch("deep_agent.aegra.channel_routes._run_and_deliver", new=capture):
+            post(client, {"sender": "ci", "text": "one"})
+            post(client, {"sender": "ci", "text": "two"})
+
+        assert runs == ["one", "two"]

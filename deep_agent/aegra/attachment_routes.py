@@ -14,6 +14,7 @@ actually read, and the filename is treated as hostile.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
@@ -236,6 +237,15 @@ async def upload_attachments(
         # nothing about the real cause.
         assistant_id = ((payload.get("metadata") or {}).get("assistant_id")) or "agent"
         existing: dict[str, Any] = dict(values.get("files") or {})
+        # Only what this upload adds goes back.
+        #
+        # The `files` channel uses a dict-merge reducer, so unchanged
+        # entries are preserved without being resent. Posting the whole
+        # map meant every prior attachment travelled again on each
+        # upload, and the request outgrew the 60 MiB body limit — a
+        # 502 "Could not store attachments" well before the 200 MiB
+        # thread quota the user was told about.
+        added: dict[str, Any] = {}
 
         def _size(entry: Any) -> int:
             if isinstance(entry, dict):
@@ -293,7 +303,13 @@ async def upload_attachments(
                 )
 
                 try:
-                    text = transcribe(name, data, _orchestrator_model())
+                    # Off the event loop: `transcribe` does a blocking
+                    # GCS upload and a blocking `model.invoke`, and
+                    # awaiting them inline stalled every other request
+                    # on this worker for the length of a transcription.
+                    text = await asyncio.to_thread(
+                        transcribe, name, data, _orchestrator_model()
+                    )
                     complete = True
                     engine, degraded = "transcription", ""
                     logger.info(
@@ -310,7 +326,7 @@ async def upload_attachments(
             # be integers", which names neither the file nor the cause.
             if text:
                 # Anything we could read: store the text.
-                existing[path] = {"content": text, "encoding": "utf-8"}
+                existing[path] = added[path] = {"content": text, "encoding": "utf-8"}
             elif needs_base64(name):
                 # PDFs, images and slides are delivered to the model as
                 # multimodal blocks, which base64-decode the content
@@ -324,7 +340,7 @@ async def upload_attachments(
                 # exists.
                 import base64
 
-                existing[path] = {
+                existing[path] = added[path] = {
                     "content": base64.standard_b64encode(data).decode("ascii"),
                     "encoding": "base64",
                 }
@@ -334,7 +350,7 @@ async def upload_attachments(
                 # and far better than base64 of an archive the model
                 # cannot interpret anyway. The file is recorded; it is
                 # simply not readable.
-                existing[path] = {
+                existing[path] = added[path] = {
                     "content": (
                         f"[{suffix_or_file(name)} file, {len(data)} bytes — "
                         "stored but not readable as text]"
@@ -366,7 +382,7 @@ async def upload_attachments(
 
         update = await client.post(
             f"/threads/{thread_id}/state",
-            json={"values": {"files": existing}, "assistant_id": assistant_id},
+            json={"values": {"files": added}, "assistant_id": assistant_id},
         )
         if update.status_code == 400 and "no associated graph" in update.text:
             # A thread only acquires a graph when it first runs, so
@@ -383,7 +399,7 @@ async def upload_attachments(
             )
             update = await client.post(
                 f"/threads/{thread_id}/state",
-                json={"values": {"files": existing}, "assistant_id": assistant_id},
+                json={"values": {"files": added}, "assistant_id": assistant_id},
             )
         if update.status_code not in (200, 201):
             logger.error("Attachment state update failed: %s", update.text[:200])
