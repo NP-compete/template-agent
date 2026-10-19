@@ -7,6 +7,10 @@ import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import logging
+
+from types import SimpleNamespace
+
 import pytest
 
 import deep_agent.aegra.mcp as mcp_mod
@@ -254,7 +258,8 @@ class TestGetMcpToolsCrossPodCache:
                 sso_token="tok", server_names=["gitlab"], user_id="user1"
             )
 
-        assert result == [fresh_tool]
+        # Plus a resume placeholder per connected server.
+        assert [t for t in result if not t.name.startswith("mcp__")] == [fresh_tool]
         assert stale_tool not in result
         self._cleanup()
 
@@ -300,7 +305,8 @@ class TestGetMcpToolsCrossPodCache:
                 sso_token="tok", server_names=["gitlab"], user_id="user1"
             )
 
-        assert result == [fresh_tool]
+        # Plus a resume placeholder per connected server.
+        assert [t for t in result if not t.name.startswith("mcp__")] == [fresh_tool]
         self._cleanup()
 
     @pytest.mark.asyncio
@@ -801,3 +807,240 @@ class TestPerServerCircuitBreakers:
 
         assert mcp_mod._get_mcp_breaker("a").is_open is True
         assert mcp_mod._get_mcp_breaker("b").is_open is False
+
+
+# ── tool budget ───────────────────────────────────────────────────────
+
+
+class TestToolBudget:
+    """Bound tools are a per-turn cost, so the count needs reporting.
+
+    Every schema goes into the system prompt on every model call.
+    This agent's count went from 193 to 322 unnoticed — roughly
+    120,000 input tokens on a question that used none of them —
+    because nothing said what it cost.
+    """
+
+    @staticmethod
+    def _tools(*names):
+        """Build tools the way the pipeline does — attributed by metadata.
+
+        Only auth placeholders carry an `mcp__` prefix in the name;
+        discovered tools keep the server's own naming and are
+        attributed by `prepare_tools_for_model`.
+        """
+        out = []
+        for n in names:
+            parts = n.split("__")
+            server = parts[1] if len(parts) >= 2 and parts[0] == "mcp" else None
+            out.append(
+                SimpleNamespace(
+                    name=n, metadata={"mcp_server": server} if server else {}
+                )
+            )
+        return out
+
+    @staticmethod
+    def _attributed(server, count, description="d"):
+        """Discovered tools: server in metadata, no prefix in the name."""
+        return [
+            SimpleNamespace(
+                name=f"{server}_tool_{i}",
+                description=description,
+                metadata={"mcp_server": server},
+            )
+            for i in range(count)
+        ]
+
+    def test_warns_past_the_budget(self, caplog):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        tools = self._tools(*[f"mcp__atlan__t{i}" for i in range(200)])
+        with caplog.at_level(logging.WARNING):
+            mcp_mod._log_tool_budget(tools)
+
+        assert any("Tool budget" in r.message for r in caplog.records)
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_stays_quiet_under_the_budget(self, caplog):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        with caplog.at_level(logging.WARNING):
+            mcp_mod._log_tool_budget(self._tools("mcp__atlan__a", "mcp__gitlab__b"))
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_orders_servers_by_token_cost(self, caplog):
+        """Fattest first: schemas differ by an order of magnitude.
+
+        A count alone does not answer "what do I drop" — twenty
+        terse tools can cost less than three verbose ones.
+        """
+        import deep_agent.aegra.mcp as mcp_mod
+
+        fat = self._attributed("fat", 1, "x" * 4000)
+        thin = self._attributed("thin", 10, "y")
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget([*thin, *fat])
+
+        logged = " ".join(r.message % r.args for r in caplog.records)
+        assert logged.index("fat=") < logged.index("thin="), logged
+
+    def test_breaks_the_count_down_by_server(self, caplog):
+        """Which server to scope is the decision this has to inform."""
+        import deep_agent.aegra.mcp as mcp_mod
+
+        # Real names are `mcp__<server>__<tool>`. The first version
+        # of this split on the leading segment and reported every
+        # server as "mcp".
+        tools = self._tools(
+            "mcp__atlan__a",
+            "mcp__atlan__b",
+            "mcp__atlan__c",
+            "mcp__gitlab__x",
+            "write_todos",
+        )
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget(tools)
+
+        logged = " ".join(r.message % r.args for r in caplog.records)
+        assert "atlan=3t/" in logged
+        assert "gitlab=1t/" in logged
+        assert "(built-in)=1t/" in logged
+        assert "mcp=" not in logged
+
+    def test_auth_placeholders_count_against_their_server(self, caplog):
+        """`mcp__<server>` with no tool segment is a connect prompt."""
+        import deep_agent.aegra.mcp as mcp_mod
+
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget(self._tools("mcp__atlan", "mcp__gitlab"))
+
+        logged = " ".join(r.message % r.args for r in caplog.records)
+        assert "atlan=1t/" in logged
+        assert "gitlab=1t/" in logged
+
+    def test_empty_tool_set_logs_nothing(self, caplog):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget([])
+        assert not caplog.records
+
+
+class TestToolBudgetAttribution:
+    """Discovered tools are attributed by metadata, not by name.
+
+    Only the auth placeholders are named `mcp__<server>`. Reading
+    the name instead reported all 319 discovered tools as built-ins,
+    which is the opposite of the number the breakdown exists to give.
+    """
+
+    def test_metadata_wins_over_the_name(self, caplog):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        tools = [
+            SimpleNamespace(
+                name="search_assets", description="d", metadata={"mcp_server": "atlan"}
+            ),
+            SimpleNamespace(
+                name="list_issues", description="d", metadata={"mcp_server": "gitlab"}
+            ),
+        ]
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget(tools)
+
+        logged = " ".join(r.message % r.args for r in caplog.records)
+        assert "atlan=1t/" in logged
+        assert "gitlab=1t/" in logged
+        assert "(built-in)" not in logged
+
+    def test_unattributed_tools_are_built_ins(self, caplog):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        with caplog.at_level(logging.INFO):
+            mcp_mod._log_tool_budget(
+                [SimpleNamespace(name="write_todos", description="d", metadata={})]
+            )
+        logged = " ".join(r.message % r.args for r in caplog.records)
+        assert "(built-in)=1t/" in logged
+
+
+class TestToolCacheEviction:
+    """The per-user tool cache has to be bounded.
+
+    Each entry is ~615,705 characters of schema for 319 tools,
+    before object overhead. The TTL is consulted only when an entry
+    is read, so a user who stops using the agent is never read again
+    and — before this — never freed. Growth tracked unique users
+    since pod start against a 2Gi limit already carrying ~1.2Gi.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        mcp_mod._cached_tools.clear()
+        mcp_mod._cached_tools_ts.clear()
+        mcp_mod._cached_connected_set.clear()
+        mcp_mod._refreshing.clear()
+        yield
+        mcp_mod._cached_tools.clear()
+        mcp_mod._cached_tools_ts.clear()
+        mcp_mod._cached_connected_set.clear()
+        mcp_mod._refreshing.clear()
+
+    def test_evicts_past_the_bound(self, monkeypatch):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        monkeypatch.setattr(mcp_mod, "_MCP_TOOL_CACHE_MAX_USERS", 3)
+        for i in range(5):
+            mcp_mod._store_cached_tools(f"user{i}:", [f"t{i}"], set())
+
+        assert len(mcp_mod._cached_tools) == 3
+        assert "user0:" not in mcp_mod._cached_tools
+        assert "user4:" in mcp_mod._cached_tools
+
+    def test_eviction_clears_every_parallel_structure(self, monkeypatch):
+        """An entry in one dict and not another is a stale auth set."""
+        import deep_agent.aegra.mcp as mcp_mod
+
+        monkeypatch.setattr(mcp_mod, "_MCP_TOOL_CACHE_MAX_USERS", 1)
+        mcp_mod._store_cached_tools("gone:", ["t"], {"atlan"})
+        mcp_mod._refreshing.add("gone:")
+        mcp_mod._store_cached_tools("kept:", ["t"], {"gitlab"})
+
+        assert "gone:" not in mcp_mod._cached_tools
+        assert "gone:" not in mcp_mod._cached_tools_ts
+        assert "gone:" not in mcp_mod._cached_connected_set
+        assert "gone:" not in mcp_mod._refreshing
+
+    def test_reading_an_entry_protects_it_from_eviction(self, monkeypatch):
+        """Least recently *used*, not least recently written.
+
+        A long-lived user whose list rarely refreshes is exactly the
+        entry worth keeping, and insertion order would evict it
+        first.
+        """
+        import deep_agent.aegra.mcp as mcp_mod
+
+        monkeypatch.setattr(mcp_mod, "_MCP_TOOL_CACHE_MAX_USERS", 2)
+        mcp_mod._store_cached_tools("old:", ["t"], set())
+        mcp_mod._store_cached_tools("new:", ["t"], set())
+
+        mcp_mod._touch_cached_tools("old:")
+        mcp_mod._store_cached_tools("newest:", ["t"], set())
+
+        assert "old:" in mcp_mod._cached_tools
+        assert "new:" not in mcp_mod._cached_tools
+
+    def test_forget_is_idempotent_on_a_missing_key(self):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        mcp_mod._forget_cached_tools("never-existed:")  # must not raise
+
+    def test_touching_a_missing_key_is_a_no_op(self):
+        import deep_agent.aegra.mcp as mcp_mod
+
+        mcp_mod._touch_cached_tools("never-existed:")
+        assert "never-existed:" not in mcp_mod._cached_tools

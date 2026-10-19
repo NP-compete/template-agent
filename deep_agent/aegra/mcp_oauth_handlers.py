@@ -26,16 +26,22 @@ from deep_agent.aegra.mcp_oauth_scopes import (
     validate_granted_scopes,
 )
 from deep_agent.aegra.mcp_token_store import McpTokenStore
-from deep_agent.aegra.redis import cache_get, cache_sadd, cache_set, cache_srem
+from deep_agent.aegra.redis import (
+    cache_get,
+    cache_sadd,
+    cache_set,
+    cache_srem,
+    run_redis,
+)
 from deep_agent.src.agent.config import agent_config
 from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
-_MCP_AUTH_SET_TTL: int = 604800  # 7 days
+_MCP_AUTH_SET_TTL = settings.MCP_AUTH_SET_TTL_SECONDS
 
 logger = get_python_logger()
 
-_OAUTH_STATE_TTL_SECONDS = 300
+_OAUTH_STATE_TTL_SECONDS = settings.MCP_OAUTH_STATE_TTL_SECONDS
 
 
 def _callback_redirect_uri(request: Request) -> str:
@@ -461,8 +467,8 @@ async def handle_mcp_connect(
     if caller_origin and caller_origin == settings.ui_origin:
         state_data_dict["caller_origin"] = caller_origin
     state_payload = json.dumps(state_data_dict)
-    if not cache_set(
-        f"mcp_oauth_state:{state}", state_payload, _OAUTH_STATE_TTL_SECONDS
+    if not await run_redis(
+        cache_set, f"mcp_oauth_state:{state}", state_payload, _OAUTH_STATE_TTL_SECONDS
     ):
         raise HTTPException(status_code=503, detail="OAuth state storage unavailable")
 
@@ -496,7 +502,7 @@ async def handle_mcp_oauth_callback(
             status_code=400,
         )
 
-    raw = cache_get(f"mcp_oauth_state:{state}")
+    raw = await run_redis(cache_get, f"mcp_oauth_state:{state}")
     if not raw:
         return HTMLResponse(
             _callback_html(error="OAuth state expired or invalid"),
@@ -691,8 +697,9 @@ async def handle_mcp_oauth_callback(
         refresh_token=body.get("refresh_token"),
         expires_at=expires_at,
         scopes=scopes,
+        account=account_from_token_response(body),
     )
-    await asyncio.to_thread(
+    await run_redis(
         cache_sadd,
         f"mcp_auth_set:{current_agent_name}:{user_id}",
         mcp_name,
@@ -700,8 +707,10 @@ async def handle_mcp_oauth_callback(
     )
     get_mcp_credential_resolver().invalidate_cache(user_id, mcp_name)
     from deep_agent.aegra.mcp import invalidate_mcp_tool_cache
+    from deep_agent.aegra.mcp_tool_auth import forget_auth_prompt
 
     invalidate_mcp_tool_cache(user_id=user_id)
+    await forget_auth_prompt(user_id, mcp_name)
     try:
         from deep_agent.aegra.graph import invalidate_graph_cache
 
@@ -784,22 +793,245 @@ async def handle_mcp_reregister(mcp_name: str) -> dict[str, Any]:
     return {"mcp_name": mcp_name, "re_registered": True, "client_id": client_id}
 
 
+_MAX_ACCOUNT_CHARS = settings.MCP_ACCOUNT_MAX_CHARS
+
+
+def account_from_token_response(body: dict[str, Any]) -> str | None:
+    """Who the user is on the provider, from the token response.
+
+    The agent's own login says nothing about the account behind an
+    integration: the same person can be one identity here and another
+    behind an integration. Answering "who is my manager" from the
+    agent's login silently answers for the wrong person when they
+    differ.
+
+    Read from the `id_token` claims, display-only. The claims are not
+    verified because they are not trusted for authorization — the
+    access token is what grants anything, and this string is only
+    ever shown to the model and the reader.
+    """
+    id_token = body.get("id_token")
+    if not isinstance(id_token, str):
+        return None
+    parts = id_token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    for field in ("email", "preferred_username", "upn", "name", "sub"):
+        value = claims.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_MAX_ACCOUNT_CHARS]
+    return None
+
+
+async def _account_from_userinfo(
+    mcp_name: str, server_cfg: dict[str, Any], access_token: str
+) -> str | None:
+    """Ask the provider who this token belongs to.
+
+    The connect-time `id_token` is the cheap path, but a provider
+    doing plain OAuth2 never sends one, and every connection made
+    before the account was recorded has nothing stored either.
+    Without this the agent falls back to the identity the user
+    signed in to *this* service with — `kind-dev-user` — and asks a
+    directory about the wrong person.
+
+    One request per connection, then it is stored.
+    """
+    try:
+        url = await _oauth_endpoint(mcp_name, server_cfg, "userinfo_endpoint")
+        if not url:
+            return None
+        async with httpx.AsyncClient(verify=mcp_httpx_verify(server_cfg)) as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=settings.MCP_USERINFO_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            claims = resp.json()
+    except Exception:
+        logger.warning("[%s] userinfo lookup failed", mcp_name, exc_info=True)
+        return None
+
+    return _account_from_claims(claims)
+
+
+async def _oauth_endpoint(
+    mcp_name: str, server_cfg: dict[str, Any], name: str
+) -> str | None:
+    """Find an OAuth endpoint, falling back to the metadata document.
+
+    `resolve_oauth_config` returns early once the four endpoints the
+    login flow needs are configured, so anything else the provider
+    publishes — `userinfo_endpoint`, `introspection_endpoint` — is
+    never fetched. Both lookups here depend on exactly those.
+    """
+    configured = await resolve_oauth_config(mcp_name, server_cfg)
+    url = configured.get(name)
+    if isinstance(url, str) and url:
+        return url
+    try:
+        metadata = await discover_oauth_metadata(mcp_name, server_cfg)
+    except Exception:
+        return None
+    url = metadata.get(name) if isinstance(metadata, dict) else None
+    return url if isinstance(url, str) and url else None
+
+
+def _account_from_claims(claims: Any) -> str | None:
+    """First usable identity field in a claims-shaped mapping."""
+    if not isinstance(claims, dict):
+        return None
+    for field in ("email", "preferred_username", "username", "upn", "name", "sub"):
+        value = claims.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_MAX_ACCOUNT_CHARS]
+    return None
+
+
+async def _account_from_introspection(
+    mcp_name: str, server_cfg: dict[str, Any], access_token: str
+) -> str | None:
+    """Ask the provider about the token when there is no userinfo.
+
+    Some servers publish no `userinfo_endpoint` — plain OAuth2,
+    not OIDC — so the OIDC path finds nothing and the agent falls
+    back to the identity the user signed in to *this* service with.
+    RFC 7662 introspection answers the same question for a provider
+    that offers it, returning `username` and `sub` for a live token.
+    """
+    try:
+        url = await _oauth_endpoint(mcp_name, server_cfg, "introspection_endpoint")
+        if not url:
+            return None
+
+        from deep_agent.aegra.mcp_auth import get_mcp_credential_resolver
+
+        (
+            client_id,
+            client_secret,
+        ) = await get_mcp_credential_resolver()._resolve_client_credentials(
+            mcp_name, server_cfg
+        )
+        if not client_id:
+            return None
+        data = {"token": access_token, "client_id": client_id}
+        if client_secret:
+            data["client_secret"] = client_secret
+
+        async with httpx.AsyncClient(verify=mcp_httpx_verify(server_cfg)) as client:
+            resp = await client.post(
+                url, data=data, timeout=settings.MCP_USERINFO_TIMEOUT_SECONDS
+            )
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception:
+        logger.warning("[%s] introspection lookup failed", mcp_name, exc_info=True)
+        return None
+
+    # An inactive token tells us nothing about who holds it.
+    if isinstance(body, dict) and body.get("active") is False:
+        return None
+    return _account_from_claims(body)
+
+
 async def handle_mcp_status(user_id: str, mcp_name: str) -> dict[str, Any]:
     """Return whether the user has a usable token for *mcp_name*."""
     server_cfg = _get_mcp_server_config(mcp_name)
     resolver = get_mcp_credential_resolver()
-    connected = await resolver.has_valid_token(user_id, mcp_name, server_cfg)
+    connected = await resolver.has_valid_token(
+        user_id, mcp_name, server_cfg, verify=True
+    )
     return {"mcp_name": mcp_name, "connected": connected}
 
 
 async def handle_mcp_connections(user_id: str) -> dict[str, Any]:
     """Return OAuth/DCR MCP connection status for the current user."""
     resolver = get_mcp_credential_resolver()
+    servers = list(_interactive_oauth_servers())
+
+    # Concurrently, because verifying is no longer free.
+    #
+    # Checking a credential now refreshes it when the access token
+    # has expired — that is the whole point, it is what makes the
+    # answer true — but it is a round trip to the provider, and one
+    # measured at 9s. Sequentially that is the page's load time
+    # multiplied by however many integrations have gone stale.
+    connected_flags = await asyncio.gather(
+        *(
+            resolver.has_valid_token(user_id, mcp_name, server_cfg, verify=True)
+            for mcp_name, server_cfg in servers
+        )
+    )
+
+    # Which account each connection is actually acting as.
+    store = McpTokenStore(settings.database_uri)
+
+    async def _account(mcp_name: str, connected: bool) -> str | None:
+        if not connected:
+            return None
+        try:
+            stored = await store.get_token(
+                settings.agent_deployment_id, user_id, mcp_name
+            )
+        except Exception:
+            return None
+        if stored is None:
+            return None
+        if stored.account:
+            return stored.account
+
+        # Nothing recorded: either the provider sent no id_token, or
+        # this connection predates the account being captured. Ask
+        # once and keep the answer.
+        server_cfg = _get_mcp_server_config(mcp_name)
+        account = await _account_from_userinfo(
+            mcp_name, server_cfg, stored.access_token
+        ) or await _account_from_introspection(
+            mcp_name, server_cfg, stored.access_token
+        )
+        logger.info(
+            "[%s] account backfill: %s", mcp_name, account or "no identity available"
+        )
+        if not account:
+            return None
+        try:
+            await store.upsert_token(
+                agent_name=stored.agent_name,
+                user_id=stored.user_id,
+                mcp_name=stored.mcp_name,
+                access_token=stored.access_token,
+                refresh_token=stored.refresh_token,
+                expires_at=stored.expires_at,
+                scopes=stored.scopes,
+                account=account,
+            )
+        except Exception:
+            logger.debug("[%s] could not persist account", mcp_name, exc_info=True)
+        return account
+
+    accounts = await asyncio.gather(
+        *(
+            _account(mcp_name, connected)
+            for (mcp_name, _cfg), connected in zip(
+                servers, connected_flags, strict=True
+            )
+        )
+    )
+
     connections: list[dict[str, Any]] = []
-    for mcp_name, server_cfg in _interactive_oauth_servers():
+    for (mcp_name, server_cfg), connected, account in zip(
+        servers, connected_flags, accounts, strict=True
+    ):
         description = server_cfg.get("description")
         display_name = server_cfg.get("display_name")
-        connected = await resolver.has_valid_token(user_id, mcp_name, server_cfg)
         connections.append(
             {
                 "mcp_name": mcp_name,
@@ -807,6 +1039,7 @@ async def handle_mcp_connections(user_id: str) -> dict[str, Any]:
                 "description": description if isinstance(description, str) else "",
                 "display_name": display_name if isinstance(display_name, str) else "",
                 "connected": connected,
+                "account": account,
             }
         )
     return {"connections": connections}
@@ -821,15 +1054,17 @@ async def handle_mcp_disconnect(user_id: str, mcp_name: str) -> dict[str, Any]:
 
     store = McpTokenStore(settings.database_uri)
     await store.delete_token(settings.agent_deployment_id, user_id, mcp_name)
-    await asyncio.to_thread(
+    await run_redis(
         cache_srem,
         f"mcp_auth_set:{settings.agent_deployment_id}:{user_id}",
         mcp_name,
     )
     get_mcp_credential_resolver().invalidate_cache(user_id, mcp_name)
     from deep_agent.aegra.mcp import invalidate_mcp_tool_cache
+    from deep_agent.aegra.mcp_tool_auth import forget_auth_prompt
 
     invalidate_mcp_tool_cache(user_id=user_id)
+    await forget_auth_prompt(user_id, mcp_name)
     try:
         from deep_agent.aegra.graph import invalidate_graph_cache
 

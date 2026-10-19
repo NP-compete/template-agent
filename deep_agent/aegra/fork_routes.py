@@ -36,7 +36,7 @@ router = APIRouter(tags=["threads"])
 
 # A fork copies state; it never runs the graph, so this only has to
 # cover a few local calls.
-_TIMEOUT = 30
+_TIMEOUT = settings.FORK_REQUEST_TIMEOUT_SECONDS
 
 
 class ForkRequest(BaseModel):
@@ -63,7 +63,7 @@ def _client(request: Request) -> httpx.AsyncClient:
     if auth:
         headers["Authorization"] = auth
     return httpx.AsyncClient(
-        base_url=f"http://127.0.0.1:{settings.AGENT_PORT}",
+        base_url=settings.loopback_base_url,
         headers=headers,
         timeout=_TIMEOUT,
     )

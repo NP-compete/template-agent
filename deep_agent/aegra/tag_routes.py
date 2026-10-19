@@ -33,10 +33,10 @@ router = APIRouter(tags=["threads"])
 
 # Long enough for "q3-planning", short enough that a tag stays a label
 # rather than becoming a note.
-MAX_TAG_LENGTH = 32
+MAX_TAG_LENGTH = settings.MAX_TAG_LENGTH
 
 # Past this, tags stop being a way to find things.
-MAX_TAGS_PER_THREAD = 20
+MAX_TAGS_PER_THREAD = settings.MAX_TAGS_PER_THREAD
 
 # Lower-case, because `Billing` and `billing` are the same tag and a
 # UI that shows both is a UI that lost half the conversations.

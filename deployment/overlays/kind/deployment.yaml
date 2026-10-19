@@ -20,6 +20,28 @@ spec:
         app: agent
         component: agent
     spec:
+      initContainers:
+        # The agent exits if PROMPT.md is missing, and an empty volume
+        # is exactly what a fresh cluster has. Without this the pod
+        # CrashLoopBackOffs until someone seeds it, which reads as a
+        # broken image rather than as "no config yet".
+        - name: wait-for-config
+          image: agent:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until [ -f /app/config/agent/PROMPT.md ]; do
+                echo "waiting for config on the volume — seed it with: make kind-seed-config"
+                sleep 3
+              done
+              echo "config present"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config/agent
+              subPath: agent
+              readOnly: true
       containers:
         - name: agent
           image: agent:local
@@ -33,7 +55,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: agent-config
+            - configMapRef:
+                name: agent-tuning
           env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/var/run/secrets/google/application_default_credentials.json"
             - name: AGENT_HOST
               value: "0.0.0.0"
             - name: AGENT_PORT
@@ -175,8 +201,10 @@ spec:
             periodSeconds: 5
             failureThreshold: 30
           livenessProbe:
+            # /livez: liveness must not depend on Postgres. See the
+            # `probes:` block in config/agent/deployment/values.yaml.
             httpGet:
-              path: /health
+              path: /livez
               port: 5002
             initialDelaySeconds: 30
             periodSeconds: 10
@@ -198,6 +226,27 @@ spec:
               memory: "2Gi"
               cpu: "500m"
           volumeMounts:
+            # Config, read from the shared volume's `agent/` subtree
+            # rather than from the image.
+            # CONFIG_PATH in the base ConfigMap already points here;
+            # what changes is who supplies it.
+            - name: config-volume
+              mountPath: /app/config/agent
+              subPath: agent
+              readOnly: true
+            # Google credentials for a local cluster, when there are
+            # any. `optional: true` on the Secret below, so a cluster
+            # without them deploys unchanged and fails at model
+            # construction exactly as it does today.
+            #
+            # The file, not GOOGLE_APPLICATION_CREDENTIALS_CONTENT:
+            # that env var is parsed as a *service account* key and
+            # fails hard without a project_id, which user ADC does
+            # not carry. The ADC path resolves the project from the
+            # file's quota_project_id instead.
+            - name: google-adc
+              mountPath: /var/run/secrets/google
+              readOnly: true
             # Documents, exposed to the agent at /documents/. readOnly
             # at the mount as well as in the backend and the
             # permission rules: three independent places, because a
@@ -210,6 +259,16 @@ spec:
             - name: agent-documents
               mountPath: /app/data/documents
       volumes:
+        - name: config-volume
+          persistentVolumeClaim:
+            claimName: config-pvc
+        - name: google-adc
+          secret:
+            # Created out of band, never committed:
+            #   kubectl -n template-agent create secret generic google-adc \
+            #     --from-file=application_default_credentials.json=$HOME/.config/gcloud/application_default_credentials.json
+            secretName: google-adc
+            optional: true
         - name: agent-documents
           persistentVolumeClaim:
             claimName: agent-documents-pvc

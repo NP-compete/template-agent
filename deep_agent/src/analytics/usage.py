@@ -43,6 +43,12 @@ logger = get_python_logger()
 # One statement, so concurrent subagent calls serialise on the row lock
 # instead of racing. Every `execution_params` on the right-hand side is
 # the pre-update value.
+# Every parameter is cast explicitly. `model` is used as a
+# jsonb_build_object *key*, where Postgres cannot infer a type from
+# context and answers "could not determine data type of parameter
+# $3" — which `record_llm_usage` caught, logged at debug and
+# counted as a failure, so every write since this feature shipped
+# failed silently and the Usage tab reported zero tokens as fact.
 _RECORD_SQL = """
 UPDATE runs
 SET execution_params =
@@ -52,67 +58,71 @@ SET execution_params =
         || jsonb_build_object(
             'input_tokens',
                 COALESCE((execution_params #>> '{usage,input_tokens}')::bigint, 0)
-                + %(input_tokens)s,
+                + %(input_tokens)s::bigint,
             'output_tokens',
                 COALESCE((execution_params #>> '{usage,output_tokens}')::bigint, 0)
-                + %(output_tokens)s,
+                + %(output_tokens)s::bigint,
+            'cached_tokens',
+                COALESCE((execution_params #>> '{usage,cached_tokens}')::bigint, 0)
+                + %(cached_tokens)s::bigint,
             'calls',
                 COALESCE((execution_params #>> '{usage,calls}')::bigint, 0) + 1,
             'models',
                 COALESCE(execution_params #> '{usage,models}', '{}'::jsonb)
-                || jsonb_build_object(%(model)s, jsonb_build_object(
+                || jsonb_build_object(%(model)s::text, jsonb_build_object(
                     'input_tokens',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'input_tokens')::bigint, 0)
-                        + %(input_tokens)s,
+                                  -> %(model)s::text ->> 'input_tokens')::bigint, 0)
+                        + %(input_tokens)s::bigint,
                     'output_tokens',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'output_tokens')::bigint, 0)
-                        + %(output_tokens)s,
+                                  -> %(model)s::text ->> 'output_tokens')::bigint, 0)
+                        + %(output_tokens)s::bigint,
+                    'cached_tokens',
+                        COALESCE((execution_params #> '{usage,models}'
+                                  -> %(model)s::text ->> 'cached_tokens')::bigint, 0)
+                        + %(cached_tokens)s::bigint,
                     'calls',
                         COALESCE((execution_params #> '{usage,models}'
-                                  -> %(model)s ->> 'calls')::bigint, 0) + 1
+                                  -> %(model)s::text ->> 'calls')::bigint, 0) + 1
                 ))
         ))
-WHERE run_id = %(run_id)s
+WHERE run_id = %(run_id)s::text
 """
-
-_pool: Any = None
-_pool_lock = asyncio.Lock()
 
 # Recording is best-effort by construction — a dashboard figure must
 # never be the reason a user's answer fails — so repeated failures are
 # only visible if we count them.
 _failures = 0
-_FAILURE_ALERT_THRESHOLD = 5
+_FAILURE_ALERT_THRESHOLD = settings.USAGE_FAILURE_ALERT_THRESHOLD
 # Accounting must never be the slowest thing in a turn.
 _ACQUIRE_TIMEOUT_SECONDS = 2.0
 _WRITE_TIMEOUT_SECONDS = 5.0
 
 
 async def _get_pool() -> Any:
-    """A small shared pool: this runs once per LLM call, not per run."""
-    global _pool  # noqa: PLW0603
-    if _pool is not None:
-        return _pool
-    async with _pool_lock:
-        if _pool is None:
-            from psycopg_pool import AsyncConnectionPool
+    """The process-wide pool.
 
-            pool = AsyncConnectionPool(
-                settings.database_uri, min_size=1, max_size=4, open=False
-            )
-            await pool.open()
-            _pool = pool
-    return _pool
+    This used to be four connections of its own, held per pod so that
+    a best-effort telemetry write would never wait. That is a poor
+    trade once the fleet's connection budget is the binding
+    constraint: recording usage is the least important thing the pod
+    does, and it should queue behind real work rather than reserve
+    capacity ahead of it.
+    """
+    from deep_agent.src.db.pool import get_pool as get_shared_pool
+
+    return await get_shared_pool()
 
 
 async def close_pool() -> None:
-    """Release the pool on shutdown."""
-    global _pool  # noqa: PLW0603
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
+    """Retained for callers that close analytics explicitly.
+
+    The pool is now shared and owned by ``deep_agent.src.db.pool``,
+    which the shutdown sequence closes once. Closing it from here
+    would pull it out from under everything else still draining.
+    """
+    return None
 
 
 async def record_llm_usage(
@@ -120,6 +130,7 @@ async def record_llm_usage(
     model: str | None,
     input_tokens: int,
     output_tokens: int,
+    cached_tokens: int = 0,
 ) -> None:
     """Add one model call's tokens to its run.
 
@@ -127,6 +138,14 @@ async def record_llm_usage(
     answered is a fact about the run even when the provider declined
     to say what it cost, and dropping it makes `calls` disagree with
     reality.
+
+    ``cached_tokens`` is a subset of ``input_tokens``, not an
+    addition to it — cached prefix tokens are billed at a discount,
+    not for free. It is recorded separately because it is the only
+    signal that prompt caching is working at all: without it a hit
+    and a miss look identical, and the system prompt carried a
+    per-second timestamp for the life of the feature precisely
+    because nothing would have shown the cost.
     """
     global _failures  # noqa: PLW0603
     if not run_id:
@@ -139,6 +158,7 @@ async def record_llm_usage(
         "model": model or "unknown",
         "input_tokens": max(0, int(input_tokens or 0)),
         "output_tokens": max(0, int(output_tokens or 0)),
+        "cached_tokens": max(0, int(cached_tokens or 0)),
     }
     try:
         pool = await _get_pool()
@@ -154,9 +174,22 @@ async def record_llm_usage(
             async with pool.connection(timeout=_ACQUIRE_TIMEOUT_SECONDS) as conn:
                 await conn.execute(_RECORD_SQL, params)
         _failures = 0
-    except Exception:
+    except Exception as exc:
         _failures += 1
+        # The first failure is a warning, not a debug line. This
+        # write has no legitimate failure mode — it is one UPDATE on
+        # a pooled connection against a row that exists — so one
+        # failure already means something is wrong.
+        #
+        # It mattered: a type-inference error in the SQL made every
+        # write fail from the day the feature shipped. Each was
+        # caught here, logged at debug, and the counter reset on
+        # every pod restart, so the threshold never fired. The Usage
+        # tab reported zero tokens as fact for the life of the
+        # feature, and nothing anywhere said otherwise.
         if _failures >= _FAILURE_ALERT_THRESHOLD:
             logger.error("usage_recording_degraded", consecutive_failures=_failures)
         else:
-            logger.debug("Failed to record usage for run %s", run_id, exc_info=True)
+            logger.warning(
+                "Failed to record usage for run %s: %s", run_id, exc, exc_info=True
+            )

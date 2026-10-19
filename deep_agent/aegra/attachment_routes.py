@@ -28,6 +28,7 @@ from deep_agent.src.attachments.extract import (
     suffix_of,
 )
 from deep_agent.src.attachments.safety import sanitise_filename, unique_name
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 
@@ -43,10 +44,13 @@ def _orchestrator_model() -> str:
 
         configured = (agent_config.get_orchestrator_config() or {}).get("model")
         if isinstance(configured, dict):
-            return str(configured.get("name") or "gemini-3.5-flash-lite")
-        return str(configured or "gemini-3.5-flash-lite")
+            return str(configured.get("name") or settings.ATTACHMENT_MODEL)
+        return str(configured or settings.ATTACHMENT_MODEL)
     except Exception:
-        return "gemini-3.5-flash-lite"
+        # Config unreadable. Falling back to a name written into this
+        # file was how three different models ended up hardcoded
+        # across the codebase, none of them the deployed one.
+        return settings.ATTACHMENT_MODEL
 
 
 logger = get_python_logger()
@@ -93,8 +97,8 @@ def _extraction_config() -> ExtractionConfig:
 # How long to wait for an in-flight run before giving up on the upload.
 # Long enough for a normal reply, short enough that a wedged run does
 # not hang the request forever.
-_RUN_WAIT_SECONDS = 90
-_RUN_POLL_SECONDS = 1.0
+_RUN_WAIT_SECONDS = settings.ATTACHMENT_RUN_WAIT_SECONDS
+_RUN_POLL_SECONDS = settings.ATTACHMENT_RUN_POLL_SECONDS
 _ACTIVE_RUN_STATUSES = {"pending", "running"}
 
 
@@ -189,7 +193,7 @@ async def upload_attachments(
         headers["Authorization"] = auth
 
     async with httpx.AsyncClient(
-        base_url=f"http://127.0.0.1:{settings.AGENT_PORT}",
+        base_url=settings.loopback_base_url,
         headers=headers,
         timeout=60,
     ) as client:
@@ -453,7 +457,7 @@ async def list_attachments(thread_id: str, request: Request) -> dict[str, Any]:
         headers["Authorization"] = auth
 
     async with httpx.AsyncClient(
-        base_url=f"http://127.0.0.1:{settings.AGENT_PORT}", headers=headers, timeout=30
+        base_url=settings.loopback_base_url, headers=headers, timeout=30
     ) as client:
         state = await client.get(f"/threads/{thread_id}/state")
         if state.status_code != 200:

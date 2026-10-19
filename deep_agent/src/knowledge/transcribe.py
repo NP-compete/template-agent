@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -25,11 +26,11 @@ _VIDEO = {"mp4", "mov", "webm", "avi", "mkv"}
 # that. Larger files go through the Files API instead — uploaded once
 # and referenced by URI. A 17 MB screen recording is ordinary, so this
 # cap is a routing decision, not a limit on what is supported.
-MAX_INLINE_BYTES = 14 * 1024 * 1024
+MAX_INLINE_BYTES = settings.TRANSCRIBE_MAX_INLINE_BYTES
 
 # Transcription is slower than any other extraction path; a few
 # minutes of audio takes tens of seconds.
-_TIMEOUT_SECONDS = 300
+_TIMEOUT_SECONDS = settings.TRANSCRIBE_TIMEOUT_SECONDS
 
 
 class TranscriptionUnavailable(RuntimeError):

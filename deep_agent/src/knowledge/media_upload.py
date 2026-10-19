@@ -23,21 +23,22 @@ from pathlib import Path
 from typing import Any
 
 from deep_agent.src.knowledge.transcribe import MAX_INLINE_BYTES
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # Vertex's documented ceiling for a single media file.
-MAX_FILE_API_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILE_API_BYTES = settings.MEDIA_MAX_FILE_API_BYTES
 
 # Objects are written under this prefix so a lifecycle rule can expire
 # them without touching anything else in the bucket.
-_PREFIX = "agent-media"
+_PREFIX = settings.MEDIA_UPLOAD_PREFIX
 
 # Kept for the Files-API-era tests and the polling helper, which still
 # applies if that path is ever reinstated for AI Studio deployments.
-_PROCESSING_TIMEOUT = 300
-_POLL_SECONDS = 2.0
+_PROCESSING_TIMEOUT = settings.MEDIA_PROCESSING_TIMEOUT_SECONDS
+_POLL_SECONDS = settings.MEDIA_POLL_SECONDS
 
 
 class MediaUploadError(RuntimeError):

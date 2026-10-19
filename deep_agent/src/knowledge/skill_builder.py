@@ -21,17 +21,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # SKILL.md is resident context whenever the skill is active. Past this
 # it stops being an index and becomes the thing it was meant to index.
-MAX_SKILL_CHARS = 6000
+MAX_SKILL_CHARS = settings.SKILL_MAX_CHARS
 
 # A reference is read on demand, so it can be longer — but not so long
 # that reading one swamps the conversation.
-MAX_REFERENCE_CHARS = 12000
+MAX_REFERENCE_CHARS = settings.SKILL_MAX_REFERENCE_CHARS
 
 
 @dataclass

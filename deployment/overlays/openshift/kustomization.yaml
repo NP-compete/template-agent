@@ -25,6 +25,7 @@ components:
   # scaleToZero: disabled in values.yaml
   # externalChannels: disabled in values.yaml
   - ../../components/documents-pvc
+  - ../../components/config-pvc
 
 labels:
   - pairs:

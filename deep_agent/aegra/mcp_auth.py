@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from datetime import UTC, datetime
@@ -28,12 +29,12 @@ from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-_RESOLVED_TOKEN_TTL_SECONDS = 30.0
-_TOKEN_EXPIRY_BUFFER_SECONDS = 30.0
-_TOKEN_REFRESH_LOCK_TTL_SECONDS = 30
-_TOKEN_REFRESH_LOCK_WAIT_SECONDS = 10.0
-_TOKEN_REFRESH_WAIT_POLL_SECONDS = 0.1
-_TOKEN_REFRESH_WAIT_ATTEMPTS = 50
+_RESOLVED_TOKEN_TTL_SECONDS = settings.MCP_RESOLVED_TOKEN_TTL_SECONDS
+_TOKEN_EXPIRY_BUFFER_SECONDS = settings.MCP_TOKEN_EXPIRY_BUFFER_SECONDS
+_TOKEN_REFRESH_LOCK_TTL_SECONDS = settings.MCP_TOKEN_REFRESH_LOCK_TTL_SECONDS
+_TOKEN_REFRESH_LOCK_WAIT_SECONDS = settings.MCP_TOKEN_REFRESH_LOCK_WAIT_SECONDS
+_TOKEN_REFRESH_WAIT_POLL_SECONDS = settings.MCP_TOKEN_REFRESH_WAIT_POLL_SECONDS
+_TOKEN_REFRESH_WAIT_ATTEMPTS = settings.MCP_TOKEN_REFRESH_WAIT_ATTEMPTS
 
 
 def resolve_oauth_client_secret(oauth_cfg: dict[str, Any], mcp_name: str) -> str | None:
@@ -62,14 +63,52 @@ def resolve_oauth_client_secret(oauth_cfg: dict[str, Any], mcp_name: str) -> str
     return None
 
 
-class NeedsAuthorization(Exception):
-    """Raised when an oauth/dcr MCP has no usable token for the user."""
+def _is_invalid_grant(body_text: str) -> bool:
+    """True when a token response says the grant itself is dead.
 
-    def __init__(self, mcp_name: str, connect_url: str) -> None:
-        """Store MCP name and connect URL for the authorization interrupt."""
+    RFC 6749 §5.2 puts `error` at the top level; this provider nests
+    it under `detail`. Both are checked, and a plain substring match
+    is the fallback so an unparseable body still reads correctly.
+    """
+    if not body_text:
+        return False
+    try:
+        body = json.loads(body_text)
+    except Exception:
+        return "invalid_grant" in body_text
+    candidates = [body]
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        candidates.append(detail)
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("error") == "invalid_grant":
+            return True
+    return "invalid_grant" in body_text
+
+
+class NeedsAuthorization(Exception):
+    """Raised when an oauth/dcr MCP has no usable token for the user.
+
+    ``reason`` separates two situations that look identical to the
+    caller and are not the same thing to the person reading the
+    answer: a server never connected, and one whose token expired
+    and could not be renewed. The first is "connect this"; the
+    second is "reconnect this, your session lapsed". Reporting both
+    as "not connected" sends someone to set up an integration they
+    already set up.
+    """
+
+    def __init__(
+        self,
+        mcp_name: str,
+        connect_url: str,
+        reason: str = "not_connected",
+    ) -> None:
+        """Store MCP name, connect URL and why authorization is needed."""
         self.mcp_name = mcp_name
         self.connect_url = connect_url
-        super().__init__(f"MCP authorization required for {mcp_name}")
+        self.reason = reason
+        super().__init__(f"MCP authorization required for {mcp_name} ({reason})")
 
 
 class McpCredentialResolver:
@@ -88,9 +127,19 @@ class McpCredentialResolver:
         return f"{base}/mcp/{mcp_name}/connect"
 
     async def resolve(
-        self, user_id: str, mcp_name: str, server_cfg: dict[str, Any]
+        self,
+        user_id: str,
+        mcp_name: str,
+        server_cfg: dict[str, Any],
+        *,
+        renew_buffer_seconds: float | None = None,
     ) -> str:
-        """Return a bearer token for this MCP, or raise :class:`NeedsAuthorization`."""
+        """Return a bearer token for this MCP, or raise :class:`NeedsAuthorization`.
+
+        ``renew_buffer_seconds`` lets a caller renew early. Discovery
+        uses it so a token due to expire during the turn is replaced
+        before the turn runs.
+        """
         auth_mode = server_cfg.get("auth_mode", "sso")
 
         if auth_mode == "sso":
@@ -109,14 +158,40 @@ class McpCredentialResolver:
         if cached and (time.time() - cached[1]) < _RESOLVED_TOKEN_TTL_SECONDS:
             return cached[0]
 
-        token = await self._resolve_oauth(user_id, mcp_name, server_cfg)
+        token = await self._resolve_oauth(
+            user_id,
+            mcp_name,
+            server_cfg,
+            renew_buffer_seconds=renew_buffer_seconds,
+        )
         self._cache[cache_key] = (token, time.time())
         return token
 
     async def has_valid_token(
-        self, user_id: str, mcp_name: str, server_cfg: dict[str, Any]
+        self,
+        user_id: str,
+        mcp_name: str,
+        server_cfg: dict[str, Any],
+        *,
+        verify: bool = False,
     ) -> bool:
-        """Return True when a usable token exists (or can be refreshed)."""
+        """Return True when a usable token exists (or can be refreshed).
+
+        ``verify`` actually performs the refresh when the stored
+        access token has expired, instead of assuming that the
+        presence of a refresh token means the credential still works.
+
+        Without it this answers a different question from the one the
+        caller is asking. The settings page reported a server as
+        **Connected** on the strength of a refresh token alone while
+        every chat turn said the session had expired — the refresh
+        was dead, and nothing here had tried it. Two surfaces, two
+        answers, and the truthful one looked like the broken one.
+
+        Default stays off: it costs a token round trip per expired
+        server, so only a caller that is about to show the user a
+        connection state should pay it.
+        """
         auth_mode = server_cfg.get("auth_mode", "sso")
         if auth_mode == "sso":
             access = _current_access_token.get()
@@ -132,7 +207,26 @@ class McpCredentialResolver:
             return False
         if self._token_valid(stored):
             return True
-        return bool(stored.refresh_token)
+        if not stored.refresh_token:
+            return False
+        if not verify:
+            return True
+        try:
+            return bool(await self.resolve(user_id, mcp_name, server_cfg))
+        except NeedsAuthorization:
+            return False
+        except Exception:
+            # A provider outage is not a disconnected integration.
+            # Report what is stored and let the next real call fail
+            # with a reason, rather than telling the user to redo an
+            # OAuth dance that was never the problem.
+            logger.warning(
+                "Could not verify %s credential for user — reporting as "
+                "connected on the strength of the stored refresh token",
+                mcp_name,
+                exc_info=True,
+            )
+            return True
 
     def invalidate_cache(self, user_id: str, mcp_name: str) -> None:
         """Drop a cached resolved token after OAuth callback or logout."""
@@ -240,8 +334,10 @@ class McpCredentialResolver:
         user_id: str,
         mcp_name: str,
         server_cfg: dict[str, Any],
+        *,
+        renew_buffer_seconds: float | None = None,
     ) -> str:
-        """Resolve an OAuth token, refreshing if expired."""
+        """Resolve an OAuth token, refreshing if expired or expiring soon."""
         current_agent_name = settings.agent_deployment_id
         stored = await self._store.get_token(current_agent_name, user_id, mcp_name)
         if stored is None:
@@ -252,7 +348,7 @@ class McpCredentialResolver:
             )
             raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
 
-        if self._token_valid(stored):
+        if self._token_valid(stored, renew_buffer_seconds):
             return stored.access_token
 
         if not stored.refresh_token:
@@ -260,7 +356,9 @@ class McpCredentialResolver:
                 "[%s] OAuth token expired and no refresh_token — authorization required",
                 mcp_name,
             )
-            raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+            raise NeedsAuthorization(
+                mcp_name, self.connect_url(mcp_name), reason="expired"
+            )
 
         lock_name = f"mcp_token_refresh:{current_agent_name}:{user_id}:{mcp_name}"
         async with distributed_lock(
@@ -282,7 +380,9 @@ class McpCredentialResolver:
                     "[%s] token expired, no refresh_token after lock — authorization required",
                     mcp_name,
                 )
-                raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+                raise NeedsAuthorization(
+                    mcp_name, self.connect_url(mcp_name), reason="expired"
+                )
 
             if lock_state == "timeout":
                 refreshed_by_peer = await self._wait_for_refreshed_token(
@@ -294,7 +394,9 @@ class McpCredentialResolver:
                     "[%s] peer refresh timed out — authorization required",
                     mcp_name,
                 )
-                raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+                raise NeedsAuthorization(
+                    mcp_name, self.connect_url(mcp_name), reason="expired"
+                )
 
             if lock_state == "no_redis":
                 logger.warning(
@@ -311,7 +413,7 @@ class McpCredentialResolver:
             "[%s] OAuth token refresh exhausted — authorization required",
             mcp_name,
         )
-        raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
+        raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name), reason="expired")
 
     async def _wait_for_refreshed_token(
         self, agent_name: str, user_id: str, mcp_name: str
@@ -330,14 +432,24 @@ class McpCredentialResolver:
         return None
 
     @staticmethod
-    def _token_valid(token: McpOAuthToken) -> bool:
-        """Return True if the token is present and not near expiry."""
+    def _token_valid(token: McpOAuthToken, buffer_seconds: float | None = None) -> bool:
+        """Return True if the token is present and not near expiry.
+
+        ``buffer_seconds`` widens the margin for callers that can
+        afford to renew early. Tool discovery passes a large one so a
+        token that would expire mid-turn is renewed before the turn
+        starts, rather than failing a tool call several seconds in
+        and asking the user to reconnect something that was working.
+        """
         if not token.access_token:
             return False
         if token.expires_at is None:
             return True
+        margin = (
+            _TOKEN_EXPIRY_BUFFER_SECONDS if buffer_seconds is None else buffer_seconds
+        )
         remaining = (token.expires_at - datetime.now(UTC)).total_seconds()
-        return remaining > _TOKEN_EXPIRY_BUFFER_SECONDS
+        return remaining > margin
 
     async def _refresh_mcp_token(
         self,
@@ -385,6 +497,35 @@ class McpCredentialResolver:
                 resp = await client.post(token_endpoint, data=data, timeout=30)
                 resp.raise_for_status()
                 body: dict[str, Any] = resp.json()
+        except httpx.HTTPStatusError as exc:
+            # The provider's own words. Without them a rejected
+            # refresh is indistinguishable from a network blip in the
+            # log, and the only visible symptom is an integration
+            # that says "expired" forever while the token row still
+            # looks healthy.
+            body_text = ""
+            try:
+                body_text = exc.response.text[:500]
+            except Exception:
+                pass
+            logger.error(
+                "MCP token refresh rejected for '%s': HTTP %s %s",
+                stored.mcp_name,
+                exc.response.status_code,
+                body_text,
+            )
+            if _is_invalid_grant(body_text):
+                # The provider has told us this refresh token is dead.
+                # Keeping it means every later check pays another round
+                # trip to be told the same thing — 9s per call against
+                # one server, on a settings page that lists eight
+                # servers and on every chat turn that touches one.
+                #
+                # Clearing it (not the row) makes the next check answer
+                # "not connected" from local state, which is both the
+                # truth and free. Reconnecting writes a new one.
+                await self._clear_dead_refresh_token(stored)
+            return None
         except Exception:
             logger.error(
                 "MCP token refresh failed for '%s'", stored.mcp_name, exc_info=True
@@ -408,7 +549,7 @@ class McpCredentialResolver:
         # above — so RFC 6749 §6 keeps the scopes of the original
         # grant. Comparing the response against the discovery
         # document's `scopes_supported` therefore checks it against
-        # something nobody requested. Dataverse advertises
+        # something nobody requested. One server advertises
         # `session:role-any` and has only ever granted `read write`, so
         # every refresh was rejected for "missing" a scope the token
         # was never issued with, and the integration dropped out an
@@ -446,6 +587,8 @@ class McpCredentialResolver:
             refresh_token=new_refresh,
             expires_at=expires_at,
             scopes=scopes,
+            # A refresh renews the credential, not the person.
+            account=stored.account,
         )
         logger.info(
             "Refreshed MCP OAuth token for '%s' (new expires_at=%s)",
@@ -453,6 +596,33 @@ class McpCredentialResolver:
             expires_at,
         )
         return new_access
+
+    async def _clear_dead_refresh_token(self, stored: McpOAuthToken) -> None:
+        """Drop a refresh token the provider has rejected outright."""
+        try:
+            await self._store.upsert_token(
+                agent_name=stored.agent_name,
+                user_id=stored.user_id,
+                mcp_name=stored.mcp_name,
+                access_token=stored.access_token,
+                refresh_token=None,
+                expires_at=stored.expires_at,
+                scopes=stored.scopes,
+                account=stored.account,
+            )
+            self.invalidate_cache(stored.user_id, stored.mcp_name)
+            logger.info(
+                "[%s] cleared rejected refresh token — reconnect required",
+                stored.mcp_name,
+            )
+        except Exception:
+            # Never let bookkeeping turn a failed refresh into a
+            # failed request; the caller still raises NeedsAuthorization.
+            logger.warning(
+                "[%s] could not clear rejected refresh token",
+                stored.mcp_name,
+                exc_info=True,
+            )
 
     async def _resolve_client_credentials(
         self, mcp_name: str, server_cfg: dict[str, Any]

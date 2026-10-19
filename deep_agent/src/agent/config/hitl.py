@@ -37,15 +37,16 @@ from deep_agent.src.agent.config.middleware import (
     ApprovalPolicy,
     HumanApprovalConfig,
 )
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-_MEMORY_PATH_PREFIX = "/memories/"
+_MEMORY_PATH_PREFIX = settings.MEMORY_PATH_PREFIX
 
 # Where skills are mounted in the agent's filesystem view, per the
 # `filesystem.routes` entry in agent.yaml.
-_SKILLS_PATH_PREFIX = "/skills/"
+_SKILLS_PATH_PREFIX = settings.SKILLS_PATH_PREFIX
 
 # Reading a skill is how the agent learns what a skill does. Prompting
 # for it interrupts the agent mid-decision, before it even knows whether

@@ -138,6 +138,7 @@ markers = [
     "slow: tests that take more than 30 seconds",
     "contract: pins a cross-repo or cross-version interface; runs per PR",
     "nightly: needs a running stack (Kind/OpenShift); too slow for per-PR",
+    "real_datastores: opts out of the conftest fixture that points Redis and Postgres at a dead port",
 ]
 
 [tool.coverage.run]

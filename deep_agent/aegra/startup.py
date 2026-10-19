@@ -55,6 +55,7 @@ async def run_startup() -> dict[str, str]:
     results["config"] = await _validate_config()
     results["ldap"] = _init_ldap()
     results["aegra_db"] = await _init_aegra_db()
+    results["run_wait"] = _install_fast_run_wait()
     results["database"] = await _ensure_database()
     _check_mcp_encryption_key()
     results["resume"] = await _resume_interrupted_runs()
@@ -139,6 +140,13 @@ def _init_ldap() -> str:
         return f"warning: {exc}"
 
 
+def _install_fast_run_wait() -> str:
+    """Stop `/runs/wait` adding up to two seconds to every turn."""
+    from deep_agent.aegra.run_wait import install_fast_run_wait
+
+    return install_fast_run_wait()
+
+
 async def _init_aegra_db() -> str:
     """Initialize Aegra's DatabaseManager for Postgres checkpointing.
 
@@ -152,14 +160,48 @@ async def _init_aegra_db() -> str:
         from aegra_api.core.database import db_manager
 
         if db_manager.engine is not None:
+            # Aegra's own lifespan got there first. The pool still
+            # needs its liveness check — skipping it here is how the
+            # fix silently did nothing in the one configuration where
+            # aegra initializes itself.
+            _enable_pool_liveness_check(db_manager)
             return "ok: already initialized"
 
         await db_manager.initialize()
+        _enable_pool_liveness_check(db_manager)
         logger.info("Aegra DatabaseManager initialized (Postgres checkpointer ready)")
         return "ok"
     except Exception as exc:
         logger.warning("Aegra DB init failed (falling back to in-memory): %s", exc)
         return f"warning: {exc}"
+
+
+def _enable_pool_liveness_check(db_manager: "Any") -> None:
+    """Make the LangGraph pool verify a connection before handing it out.
+
+    Aegra builds ``lg_pool`` with psycopg's default ``check=None``, so
+    a connection the server has already closed — proxy idle timeout,
+    failover, network partition — is handed to the next borrower and
+    fails that caller's query. After a failover this arrives as one
+    error per pooled connection, all at once, looking like an
+    application fault. The SQLAlchemy engine beside it already guards
+    this with ``pool_pre_ping=True``; the LangGraph pool does not.
+
+    ``_check`` is private, and setting it here is a patch over an
+    upstream gap rather than a design. The real fix is a ``check``
+    argument on aegra's pool construction; until that exists this is
+    the only seam, so it is deliberately best-effort and never fatal.
+    """
+    pool = getattr(db_manager, "lg_pool", None)
+    if pool is None:
+        return
+    try:
+        from psycopg_pool import AsyncConnectionPool
+
+        pool._check = AsyncConnectionPool.check_connection  # noqa: SLF001
+        logger.info("LangGraph pool: liveness check enabled on checkout")
+    except Exception as exc:
+        logger.warning("Could not enable LangGraph pool liveness check: %s", exc)
 
 
 def _clear_stale_done_keys(run_ids: list[str]) -> None:

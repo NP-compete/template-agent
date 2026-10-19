@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ PAGE_BREAK = "\f"
 # Below this, remote output is treated as suspect and the built-in
 # parser is run to compare. Chosen to be shorter than any real
 # document and longer than every placeholder string the services emit.
-SUSPECT_CHARS = 200
+SUSPECT_CHARS = settings.ATTACHMENT_SUSPECT_CHARS
 
 
 class ExtractionUnavailable(RuntimeError):

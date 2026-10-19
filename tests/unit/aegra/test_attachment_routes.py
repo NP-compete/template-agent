@@ -37,11 +37,30 @@ class TestOrchestratorModel:
         with patch("deep_agent.src.agent.config.agent_config", cfg):
             assert ar._orchestrator_model() == "claude-x"
 
-    def test_falls_back_when_config_raises(self):
+    def test_falls_back_to_the_configured_model_when_config_raises(self):
+        """The fallback is a setting, not a name written into the module.
+
+        Four literals across four files named three different models,
+        none of them the deployed one. Harmless until config fails to
+        load — exactly the moment they go live.
+        """
+        from deep_agent.src.settings import settings
+
         cfg = MagicMock()
         cfg.get_orchestrator_config.side_effect = RuntimeError("no config")
         with patch("deep_agent.src.agent.config.agent_config", cfg):
-            assert ar._orchestrator_model() == "gemini-3.5-flash-lite"
+            assert ar._orchestrator_model() == settings.ATTACHMENT_MODEL
+
+    def test_the_fallback_is_overridable(self):
+        from deep_agent.src.settings import settings
+
+        cfg = MagicMock()
+        cfg.get_orchestrator_config.side_effect = RuntimeError("no config")
+        with (
+            patch("deep_agent.src.agent.config.agent_config", cfg),
+            patch.object(settings, "ATTACHMENT_MODEL", "some-other-model"),
+        ):
+            assert ar._orchestrator_model() == "some-other-model"
 
 
 class TestConfigReaders:

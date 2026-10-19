@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import pytest
 
+from deep_agent.src.settings import settings
 from deep_agent.src.agent.llm import (
-    _MIN_THINKING_BUDGET,
-    _THINKING_SHARE,
     _thinking_budget_for,
 )
 
@@ -39,7 +38,7 @@ class TestTheBudgetLeavesRoom:
 
     def test_it_is_a_fraction_of_the_allowance(self):
         assert _thinking_budget_for("gemini-2.5-pro", 8192) == int(
-            8192 * _THINKING_SHARE
+            8192 * settings.THINKING_BUDGET_SHARE
         )
 
     def test_a_small_allowance_is_raised_toward_a_usable_floor(self):

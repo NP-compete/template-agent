@@ -80,6 +80,14 @@ spec:
             - containerPort: 5002
               name: http
               protocol: TCP
+          # Pool bounds and timeouts only. agent-config stays listed
+          # key by key below — an unlisted key there must not reach the
+          # pod — but wiring a dozen related capacity knobs that way is
+          # a hundred lines in which one forgotten entry silently
+          # restores a library default. See docs/scalability.md.
+          envFrom:
+            - configMapRef:
+                name: agent-tuning
           env:
             - name: AGENT_HOST
               valueFrom:
@@ -106,6 +114,40 @@ spec:
                 configMapKeyRef:
                   name: agent-config
                   key: LANGFUSE_TRACING_ENVIRONMENT
+            # OTLP export. `optional: true` on all of them so an overlay
+            # that has not adopted the keys yet still starts — the agent
+            # falls back to the defaults in
+            # config/agent/runtime/observability.yaml, which are off.
+            - name: ENABLE_OTEL
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-config
+                  key: ENABLE_OTEL
+                  optional: true
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-config
+                  key: OTEL_EXPORTER_OTLP_ENDPOINT
+                  optional: true
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-config
+                  key: OTEL_EXPORTER_OTLP_INSECURE
+                  optional: true
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-config
+                  key: OTEL_METRIC_EXPORT_INTERVAL
+                  optional: true
+            - name: SERVICE_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: agent-config
+                  key: SERVICE_NAME
+                  optional: true
             # Corporate root CAs, fetched at container start and
             # appended to the system trust bundle by entrypoint.sh.
             # Internal MCP servers and any internal HTTPS dependency
@@ -284,8 +326,10 @@ spec:
             periodSeconds: 5
             failureThreshold: 12
           livenessProbe:
+            # /livez: liveness must not depend on Postgres. See the
+            # `probes:` block in config/agent/deployment/values.yaml.
             httpGet:
-              path: /health
+              path: /livez
               port: 5002
             initialDelaySeconds: 30
             periodSeconds: 10

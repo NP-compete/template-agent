@@ -8,8 +8,9 @@ in process memory for multi-pod safety.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -26,12 +27,13 @@ from deep_agent.aegra.mcp_apps import (
     get_tool_visibility,
     is_app_callable,
 )
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # Cap tools/list pagination when resolving a tool by name (host tools/call).
-_MAX_TOOLS_LIST_PAGES = 20
+_MAX_TOOLS_LIST_PAGES = settings.MCP_TOOLS_LIST_MAX_PAGES
 
 
 def _tool_from_mcp_meta(name: str, meta: dict[str, Any] | None) -> SimpleNamespace:
@@ -118,6 +120,65 @@ async def _resolve_bearer(
     return bearer
 
 
+# Sessions open for the current turn, keyed by (server, user).
+#
+# Every host-proxy operation used to build its own client and pay a
+# full MCP `initialize` handshake. Two resource listings in one turn
+# meant two handshakes and twelve seconds against a server that
+# answers each call in well under one — and they ran back to back,
+# which is what "things happen sequentially in the subagent" looks
+# like from outside.
+#
+# Scoped to the turn and keyed on the user, because a session is
+# established with that user's bearer and must never be handed to
+# anyone else.
+_open_sessions: contextvars.ContextVar[dict[tuple[str, str], Any] | None] = (
+    contextvars.ContextVar("_mcp_host_sessions", default=None)
+)
+
+
+async def enter_mcp_session_scope() -> None:
+    """Begin reusing MCP sessions for this turn.
+
+    There is no matching exit. The graph is built in the request
+    context and runs in a worker task, so a context manager spanning
+    the turn has nowhere to close — the same boundary that made a
+    contextvar unreadable at serialisation time.
+
+    Sessions are instead bounded by the client's own timeout and by
+    the context dying with the task. That is a deliberate trade:
+    reusing a handshake across a turn is worth more than closing it
+    a few seconds earlier, and the alternative measured at twelve
+    seconds for two listings.
+    """
+    if _open_sessions.get() is None:
+        cache: dict[tuple[str, str], Any] = {}
+        _open_sessions.set(cache)
+        _session_stacks[id(cache)] = AsyncExitStack()
+
+
+@asynccontextmanager
+async def mcp_session_scope() -> AsyncIterator[None]:
+    """Reuse MCP sessions for the duration of one turn.
+
+    Outside this scope every call opens and closes its own session,
+    which is the safe default: a session left open past the request
+    that authorised it is a connection nobody owns.
+    """
+    stack = AsyncExitStack()
+    token = _open_sessions.set({})
+    try:
+        async with stack:
+            _session_stacks[id(_open_sessions.get())] = stack
+            yield
+    finally:
+        _session_stacks.pop(id(_open_sessions.get() or {}), None)
+        _open_sessions.reset(token)
+
+
+_session_stacks: dict[int, AsyncExitStack] = {}
+
+
 @asynccontextmanager
 async def mcp_session(
     mcp_name: str,
@@ -125,8 +186,15 @@ async def mcp_session(
     user_id: str,
     sso_token: str | None,
 ) -> AsyncIterator[Any]:
-    """Open a short-lived MCP client session for host proxy operations."""
+    """Open an MCP client session, reusing one inside a session scope."""
     ensure_mcp_apps_capability_advertised()
+
+    cache = _open_sessions.get()
+    key = (mcp_name, user_id or "")
+    if cache is not None and key in cache:
+        yield cache[key]
+        return
+
     entry = _get_enabled_server(mcp_name)
     bearer = await _resolve_bearer(
         mcp_name, entry, user_id=user_id, sso_token=sso_token
@@ -134,6 +202,20 @@ async def mcp_session(
     config = _build_server_config(entry, bearer)
     client = MultiServerMCPClient({mcp_name: config})
     timeout = float(entry.get("timeout", 30))
+
+    if cache is not None:
+        # Inside a scope: hand the session's lifetime to the scope's
+        # exit stack so later calls in this turn reuse it and it is
+        # still closed exactly once, when the turn ends.
+        stack = _session_stacks.get(id(cache))
+        if stack is not None:
+            async with asyncio.timeout(timeout):
+                session = await stack.enter_async_context(client.session(mcp_name))
+            cache[key] = session
+            logger.debug("[%s] MCP session opened for this turn", mcp_name)
+            yield session
+            return
+
     try:
         async with asyncio.timeout(timeout):
             async with client.session(mcp_name) as session:
@@ -295,7 +377,7 @@ async def inventory(
                 #
                 # 261 of 323 tools across the eight configured servers
                 # populate `readOnlyHint` (gworkspace 101/101, gitlab
-                # 63/116, dataverse 0/6). Absent stays absent rather
+                # 63/116, another 0/6). Absent stays absent rather
                 # than defaulting to either value: "unknown" and
                 # "writes" must be distinguishable, because the caller
                 # treats unknown as needing approval.

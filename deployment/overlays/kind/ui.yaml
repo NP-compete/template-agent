@@ -55,8 +55,9 @@ spec:
                   name: agent-config
                   key: REDIS_PORT
           volumeMounts:
-            - name: ui-config
+            - name: config-volume
               mountPath: /etc/config
+              subPath: ui
               readOnly: true
           readinessProbe:
             httpGet:
@@ -79,72 +80,9 @@ spec:
               memory: "1Gi"
               cpu: "500m"
       volumes:
-        - name: ui-config
-          configMap:
-            name: ui-config
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ui-config
-  labels:
-    app: template-agent
-    component: ui
-data:
-  ui.yaml: |
-    # The name and mark are config, never constants in code. The
-    # mounted ConfigMap is what the UI actually reads, so omitting
-    # branding here left the masthead on its generic fallback while
-    # the repo's own config/ui/settings.yaml said Workpilot.
-    branding:
-      title: "Workpilot"
-      logo_url: "https://cdn.prod.website-files.com/6447ad3a38d5f03bc4e0a3b2/69e9fcfe18543c02af4fde56_WorkPilot.jpg"
-      favicon_url: "https://cdn.prod.website-files.com/6447ad3a38d5f03bc4e0a3b2/69e9fcfe18543c02af4fde56_WorkPilot.jpg"
-    server:
-      host: "0.0.0.0"
-      port: 8080
-      body_limit: 1048576
-    logging:
-      level: info
-    cors:
-      origin: "http://localhost:5173"
-    security:
-      helmet:
-        enabled: true
-        csp:
-          default_src: ["'self'"]
-          script_src: ["'self'", "'unsafe-inline'"]
-          style_src: ["'self'", "'unsafe-inline'"]
-          img_src: ["'self'", "data:", "blob:"]
-          connect_src: ["'self'"]
-          font_src: ["'self'"]
-          object_src: ["'none'"]
-          frame_ancestors: ["'none'"]
-        cross_origin_embedder_policy: false
-      rate_limit:
-        enabled: true
-        # Matches template-ui's own default. A chat UI is chattier
-        # than a REST client — one analytics page load is four calls
-        # — and 100/min fired during ordinary use.
-        max: 600
-        window: "1 minute"
-        # One hop: nginx-ingress in Kind, the Route in OpenShift.
-        # Without it every request carries the ingress pod's address
-        # and the whole deployment shares a single bucket.
-        trust_proxy: 1
-        exclude_paths:
-          - "/api/health"
-          - "/_health"
-      session:
-        secure_cookie: false
-        max_age_days: 30
-    otel:
-      enabled: false
-      service_name: "template-ui"
-    announcement:
-      enabled: false
-      message: ""
-      type: info
+        - name: config-volume
+          persistentVolumeClaim:
+            claimName: config-pvc
 ---
 apiVersion: v1
 kind: Service

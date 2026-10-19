@@ -18,6 +18,7 @@ from collections import OrderedDict
 from typing import Any
 
 from deep_agent.aegra.auth import encrypt_user_id
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -35,7 +36,7 @@ _pii_initialized = False
 
 # Cap abandoned HITL open roots (never resumed / never replaced by a new message).
 # Mirrors Langfuse's MAX_PENDING_RESUME_TRACE_CONTEXTS bound.
-_MAX_OPEN_HITL_ROOTS = 1024
+_MAX_OPEN_HITL_ROOTS = settings.TELEMETRY_MAX_OPEN_HITL_ROOTS
 
 # Process-wide Langfuse handler so HITL interrupt->resume keeps the same trace.
 # Langfuse stores pending resume context on the handler instance; a fresh
@@ -50,13 +51,22 @@ HitlAwareCallbackHandler: Any | None = None
 
 
 def _get_trace_name() -> str:
-    """Resolve trace name: agent.yaml name > env var > fallback."""
-    try:
-        from deep_agent.src.agent.config import agent_config
+    """Name the operation, not the agent.
 
-        return agent_config.get_name()
-    except Exception:
-        return os.environ.get("LANGFUSE_TRACE_NAME", "template-agent")
+    This used to return the agent's own name, so every trace in the
+    project was called `template-agent`. A name that is the same for
+    everything cannot be filtered on, and Langfuse guidance is
+    explicit that the agent and model are already their own
+    attributes: naming traces after them means swapping either one
+    silently breaks every saved filter and evaluator built on the
+    name.
+
+    Verb-first and low cardinality instead, and configurable so a
+    deployment that serves a different operation can say so.
+    """
+    from deep_agent.src.settings import settings
+
+    return os.environ.get("LANGFUSE_TRACE_NAME") or settings.LANGFUSE_TRACE_NAME
 
 
 def _langfuse_configured() -> bool:
@@ -477,7 +487,7 @@ class LangfuseObservabilityProvider:
         self, run_id: str, thread_id: str, user_identity: str | None = None
     ) -> dict[str, Any]:
         """Return Langfuse metadata keys for RunnableConfig injection."""
-        from deep_agent.utils.pylogger import _trace_id_var
+        from deep_agent.utils.pylogger import _trace_id_var, current_otel_ids
 
         metadata: dict[str, Any] = {
             "langfuse_trace_name": _get_trace_name(),
@@ -488,9 +498,26 @@ class LangfuseObservabilityProvider:
             metadata["langfuse_session_id"] = thread_id
             # Langfuse keys pending resume context by metadata["thread_id"].
             metadata["thread_id"] = thread_id
+        # The trace id is metadata, not a tag.
+        #
+        # As a tag it was a new value on every single run, which is
+        # the one thing tags must not be: they are for business
+        # dimensions known upfront and are immutable once the
+        # observation is created. One tag value per trace makes the
+        # tag dimension unusable for grouping and grows the tag
+        # index without bound. As metadata it is still filterable,
+        # which is all it was ever for.
         trace_id = _trace_id_var.get()
         if trace_id:
-            metadata["langfuse_tags"] = [f"trace_id:{trace_id}"]
+            metadata["trace_id"] = trace_id
+        # And the W3C id alongside it, for the same reason one step on:
+        # `trace_id` reaches the logs, this reaches whatever the spans
+        # were exported to. Langfuse holds the only record of what the
+        # model was actually asked, so it is the one backend that must
+        # be reachable from both of the others.
+        otel_trace_id, _ = current_otel_ids()
+        if otel_trace_id:
+            metadata["otel_trace_id"] = otel_trace_id
         return metadata
 
     def is_enabled(self) -> bool:

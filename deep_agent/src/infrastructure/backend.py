@@ -38,7 +38,7 @@ from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger(log_level=settings.PYTHON_LOG_LEVEL)
 
-_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+_SYSTEM_PATH = settings.SYSTEM_PATH
 _PASSTHROUGH_VARS = ("HOME", "USER", "LANG", "LC_ALL", "TZ", "TERM")
 
 
@@ -270,14 +270,14 @@ def _ensure_venv(root_dir: Path, pyproject: Path) -> Path:
     # Prefer /app/.cache inside containers (always writable on OpenShift);
     # fall back to /tmp then ~/.cache for local / non-container runs.
     # OpenShift runs with arbitrary UID so Path.home() may not resolve.
-    app_cache = Path("/app/.cache")
+    app_cache = Path(settings.APP_CACHE_PATH)
     if app_cache.parent.is_dir():
         base_cache = app_cache
     else:
         try:
             base_cache = Path.home() / ".cache"
         except (RuntimeError, KeyError):
-            base_cache = Path("/tmp/.cache")  # noqa: S108 — OpenShift arbitrary UID fallback
+            base_cache = Path(settings.TMP_CACHE_PATH)  # noqa: S108 — OpenShift arbitrary UID fallback
     cache_dir = base_cache / "template-agent" / "venvs"
     cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)  # User-only permissions
 

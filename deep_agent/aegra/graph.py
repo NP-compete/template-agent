@@ -57,7 +57,7 @@ _startup_done = False  # noqa: E402
 
 _graph_cache: dict[str, Any] = {}
 _graph_cache_ts: dict[str, float] = {}
-_MAX_GRAPH_CACHE_SIZE = 16
+_MAX_GRAPH_CACHE_SIZE = settings.GRAPH_CACHE_MAX_SIZE
 
 _SAFETY_STOP_INSTRUCTION = """
 ## Content Safety (Enforced by Framework)
@@ -98,8 +98,15 @@ def _append_capability_restriction(system_prompt: str) -> str:
 
 def _append_memory_instructions(system_prompt: str) -> str:
     """Append platform memory instructions (not from the config volume)."""
-    from deep_agent.src.memory.instructions import append_memory_instructions
+    from deep_agent.src.memory.instructions import (
+        append_memory_instructions,
+        use_compact_memory_prompt,
+    )
 
+    # These instructions and deepagents' own `<memory_guidelines>` say
+    # the same thing. Appending ours is the point at which keeping
+    # both becomes waste, so drop the longer one here.
+    use_compact_memory_prompt()
     return append_memory_instructions(system_prompt)
 
 
@@ -253,6 +260,29 @@ def _exclude_resource_read_from_eviction() -> None:
         )
 
 
+def _mcp_pool(orchestrator_cfg: dict[str, Any]) -> list[str]:
+    """Every MCP server this agent configuration can reach.
+
+    The union of the orchestrator's own `mcps:` and those of every
+    subagent, because subagents filter down from the pool the
+    orchestrator opens rather than connecting for themselves.
+
+    Sorted so the tool order — and therefore the cacheable prompt
+    prefix — is stable across processes.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    names: set[str] = set(orchestrator_cfg.get("mcps") or [])
+    try:
+        for sub_cfg in (agent_config.get_all_subagent_configs() or {}).values():
+            names.update(sub_cfg.get("mcps") or [])
+    except Exception:
+        # A malformed subagent must not take the orchestrator's own
+        # integrations down with it.
+        logger.warning("Could not read subagent MCP lists", exc_info=True)
+    return sorted(names)
+
+
 async def agent(runtime: ServerRuntime) -> Any:
     """Async graph factory — invoked per-request by Aegra.
 
@@ -279,8 +309,12 @@ async def agent(runtime: ServerRuntime) -> Any:
         refresh_access_token,
         set_mcp_auth_context,
     )
+    from deep_agent.aegra.mcp_host import enter_mcp_session_scope
     from deep_agent.aegra.mcp_resource_tools import get_mcp_resource_tools
-    from deep_agent.aegra.mcp_tool_auth import wrap_mcp_tools_for_auth
+    from deep_agent.aegra.mcp_tool_auth import (
+        clear_auth_requests,
+        wrap_mcp_tools_for_auth,
+    )
     from deep_agent.src.agent.config import agent_config
     from deep_agent.src.infrastructure.async_tasks import build_async_middleware
     from deep_agent.src.infrastructure.backend import get_configured_backend
@@ -305,13 +339,33 @@ async def agent(runtime: ServerRuntime) -> Any:
             refresh_token = cached[1]
 
     set_mcp_auth_context(sso_token, refresh_token, user_identity)
+    # Fresh per turn: an integration connected since the last answer
+    # must not still be prompting for authorization.
+    clear_auth_requests()
+    # Let MCP operations in this turn share one session per server
+    # instead of each paying a fresh `initialize` handshake. Entered
+    # without a matching exit on purpose — see `enter_mcp_session_scope`.
+    await enter_mcp_session_scope()
     orchestrator_cfg = agent_config.get_orchestrator_config()
     agent_name = orchestrator_cfg.get("name", "orchestrator")
-    orch_model_raw = orchestrator_cfg.get("model", "gemini-3.1-pro-preview")
+    orch_model_raw = orchestrator_cfg.get("model", settings.DEFAULT_MODEL)
     system_prompt = orchestrator_cfg.get("body", "")
     skill_paths = orchestrator_cfg.get("skill_paths", [])
     tool_names = orchestrator_cfg.get("tools")
     mcp_server_names = orchestrator_cfg.get("mcps", [])
+    # The connection pool is the union of every server any agent in
+    # this config declares; `mcp_server_names` stays the orchestrator's
+    # own, narrower set and is what gets bound to its model.
+    #
+    # These are two different questions and conflating them removed
+    # capability silently. Subagents do not open their own
+    # connections: `_filter_tools_by_mcp_names` narrows *down* from
+    # the pool the orchestrator built. So trimming the orchestrator's
+    # `mcps:` to shrink its prompt did not move those servers behind
+    # the subagents that declare them — it made them unreachable, and
+    # the agent then reported that tools it genuinely has did not
+    # exist.
+    mcp_pool_names = _mcp_pool(orchestrator_cfg)
 
     # Resolve the personalization user ID to match what the BFF proxy
     # sends as X-User-ID (preferred_username from JWT, not sub UUID).
@@ -383,12 +437,21 @@ async def agent(runtime: ServerRuntime) -> Any:
 
     mcp_tools = await get_mcp_tools(
         sso_token=sso_token,
-        server_names=mcp_server_names or None,
+        server_names=mcp_pool_names or None,
         user_id=user_identity,
     )
     mcp_tools = wrap_mcp_tools_for_auth(mcp_tools)
 
-    all_available_tools = list(mcp_tools)
+    # `mcp_tools` is the pool and goes to the subagents untouched
+    # (load_subagents below). What the *orchestrator* binds is its own
+    # declared subset — otherwise opening the pool to make subagents
+    # work would put every server's schemas back into the orchestrator
+    # prompt, which is the cost the subagents exist to avoid.
+    from deep_agent.src.infrastructure.subagents import (
+        _filter_tools_by_mcp_names,
+    )
+
+    all_available_tools = _filter_tools_by_mcp_names(list(mcp_tools), mcp_server_names)
 
     from deep_agent.src.capability import (
         enforce_capability,
@@ -401,7 +464,7 @@ async def agent(runtime: ServerRuntime) -> Any:
 
     resource_tools = wrap_mcp_tools_for_auth(
         get_mcp_resource_tools(
-            server_names=mcp_server_names or None,
+            server_names=mcp_pool_names or None,
             allowed_uris=orchestrator_cfg.get("resources") or None,
         )
     )
@@ -522,30 +585,42 @@ async def agent(runtime: ServerRuntime) -> Any:
         mount = AttachmentsConfig().mount_path
     middleware.append(build_attachment_middleware(mount))
 
-    # Name the integrations that actually work. Every enabled MCP
-    # server contributes a tool whether or not anyone has connected
-    # to it, so without this the model cannot tell a usable
-    # integration from one that will answer "authorization
-    # required" — it picks one, fails, and has nothing useful to
-    # tell the user.
-    if mcp_tools:
-        from deep_agent.src.mcp_status.middleware import build_mcp_status_middleware
+    # Tell the agent what it is: the skills it can follow, who it can
+    # delegate to, which integrations are usable *right now*, and
+    # what its policy refuses. Every enabled MCP server contributes a
+    # tool whether or not anyone has connected to it, so without this
+    # the model cannot tell a usable integration from one that will
+    # answer "authorization required" — it picks one, fails, and has
+    # nothing useful to tell the user. The same is true of a tool its
+    # approval policy denies outright.
+    #
+    # One middleware, not two. The MCP notice used to be its own and
+    # left the model two descriptions of itself to reconcile.
+    #
+    # The identity is passed in, not discovered inside the
+    # middleware. The contextvar is not reliably set by the time a
+    # model call is wrapped, and resolving to the wrong user finds no
+    # tokens and reports everything as disconnected — confidently,
+    # which is worse than silence. This is the same value
+    # `get_mcp_tools` was given above, so the notice and the tool
+    # list cannot disagree.
+    from deep_agent.src.self_knowledge.middleware import (
+        build_self_knowledge_middleware,
+    )
 
-        # The identity is passed in, not discovered inside the
-        # middleware. The contextvar is not reliably set by the time
-        # a model call is wrapped, and resolving to the wrong user
-        # finds no tokens and reports everything as disconnected —
-        # confidently, which is worse than silence. This is the same
-        # value `get_mcp_tools` was given above, so the notice and
-        # the tool list cannot disagree.
-        middleware.append(build_mcp_status_middleware(user_identity))
+    self_knowledge = build_self_knowledge_middleware(
+        user_identity if mcp_tools else None,
+        model_name=str(model_name or ""),
+    )
+    if self_knowledge is not None:
+        middleware.append(self_knowledge)
 
     memory = resolve_memory_param(resolved_mw) if user_memory_enabled else None
 
     if skill_paths and resolved_mw.skills_enabled:
-        from deep_agent.src.agent.config.resolver import to_virtual_skill_paths
+        from deep_agent.src.agent.config.resolver import to_virtual_skill_sources
 
-        skills_param = to_virtual_skill_paths(skill_paths)
+        skills_param = to_virtual_skill_sources(skill_paths)
     else:
         skills_param = None
 
@@ -689,10 +764,11 @@ async def agent(runtime: ServerRuntime) -> Any:
     tool_count = len(tools)
     sub_count = len(subagents) if subagents else 0
     logger.info(
-        "Agent ready: %d tool(s), %d subagent(s), %d middleware, mcp_auth=%s",
+        "Agent ready: %d tool(s), %d subagent(s), %d middleware [%s], mcp_auth=%s",
         tool_count,
         sub_count,
         len(middleware),
+        ", ".join(type(m).__name__ for m in middleware),
         bool(sso_token),
     )
 

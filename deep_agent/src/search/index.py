@@ -31,9 +31,9 @@ logger = get_python_logger()
 
 # Bounds a single refresh so one user with a huge history cannot turn a
 # search into a minutes-long request.
-MAX_THREADS_PER_REFRESH = 200
+MAX_THREADS_PER_REFRESH = settings.SEARCH_MAX_THREADS_PER_REFRESH
 # Keeps one pathological thread from dominating the index.
-MAX_BODY_CHARS = 100_000
+MAX_BODY_CHARS = settings.SEARCH_MAX_BODY_CHARS
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_search (

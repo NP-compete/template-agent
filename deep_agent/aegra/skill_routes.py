@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from deep_agent.src.agent.config.parser import parse_frontmatter
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -88,7 +89,7 @@ _READABLE_SUFFIXES = {".md", ".json", ".yaml", ".yml", ".txt", ".py", ".sh"}
 
 # One skill's reference file is prose, not a dataset. A cap keeps a
 # stray large file from becoming a multi-megabyte JSON response.
-_MAX_FILE_BYTES = 256_000
+_MAX_FILE_BYTES = settings.SKILL_MAX_FILE_BYTES
 
 
 @router.get("/skills/{name}")
@@ -212,6 +213,18 @@ async def list_subagents() -> dict[str, Any]:
                 # prose.
                 "mcps": sorted(str(m) for m in (cfg.get("mcps") or [])),
                 "skills": sorted(str(s) for s in (cfg.get("skills") or [])),
+                # The enforced allow-list, not a hint. An explicit
+                # `tools:` is authoritative and is never widened with
+                # the rest of the declared servers' tools, so a
+                # subagent naming `mcps: [gitlab]` can still be
+                # confined to two of its tools — which the mcps list
+                # alone reads as the opposite of.
+                "tools": sorted(str(t) for t in (cfg.get("tools") or [])),
+                "tool_scope": (
+                    "explicit"
+                    if cfg.get("tools")
+                    else ("inherited" if cfg.get("mcps") else "none")
+                ),
             }
         )
     return {"subagents": out}
@@ -251,6 +264,293 @@ async def read_prompt() -> dict[str, Any]:
     if path is None or not path.is_file():
         raise HTTPException(status_code=404, detail="No prompt configured")
     return {"name": path.name, "files": [_split_markdown(path)]}
+
+
+def _provider_of(model: str) -> str:
+    """Which provider serves this name.
+
+    By prefix, like `llm.create_model` decides it — an allowlist here
+    would be a second list to keep in step, and the one that goes
+    stale is always the copy.
+    """
+    from deep_agent.src.agent.llm import (
+        is_claude_model,
+        is_openai_model,
+        is_vertex_model,
+    )
+
+    name = (model or "").strip()
+    if not name:
+        return "unknown"
+    if is_claude_model(name):
+        return "anthropic-vertex"
+    if is_vertex_model(name):
+        return "google-vertex"
+    if is_openai_model(name):
+        return "openai"
+    # Everything else goes to the configured OpenAI-compatible
+    # endpoint, which is how a local stub or a self-hosted model is
+    # reached.
+    return "openai-compatible"
+
+
+@router.get("/models")
+async def list_models() -> dict[str, Any]:
+    """Which model answers, and which model each subagent uses.
+
+    Ungated for the same reason the skill list is: "which model wrote
+    this" is a question a reader of an answer is entitled to ask, and
+    it is the first thing anyone checks when an answer looks wrong.
+
+    Names and roles only. Endpoints, project ids and credentials are
+    deployment facts, not capability facts, and belong in /admin.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    def _name_of(raw: Any) -> str:
+        # `model:` is either a bare name or a mapping with one.
+        if isinstance(raw, dict):
+            return str(raw.get("name") or "").strip()
+        return str(raw or "").strip()
+
+    entries: list[dict[str, Any]] = []
+
+    orchestrator = ""
+    try:
+        orchestrator = _name_of(
+            (agent_config.get_orchestrator_config() or {}).get("model")
+        )
+    except Exception:
+        logger.debug("Could not read the orchestrator model", exc_info=True)
+    if orchestrator:
+        entries.append(
+            {
+                "role": "orchestrator",
+                "name": orchestrator,
+                "provider": _provider_of(orchestrator),
+                "used_by": "The agent itself — every turn that is not delegated.",
+            }
+        )
+
+    try:
+        subagents = agent_config.get_all_subagent_configs() or {}
+    except Exception:
+        logger.debug("Could not read subagent configs", exc_info=True)
+        subagents = {}
+
+    for name in sorted(subagents):
+        cfg = subagents.get(name) or {}
+        model = _name_of(cfg.get("model")) or orchestrator
+        entries.append(
+            {
+                "role": "subagent",
+                "name": model,
+                "provider": _provider_of(model),
+                "used_by": name,
+                # True when the subagent names no model of its own, so
+                # a reader can tell "chose this" from "inherited it".
+                "inherited": not _name_of(cfg.get("model")),
+            }
+        )
+
+    # A profile can strip tools or middleware for a given model, so
+    # a capability Skills still advertises can be quietly absent.
+    # Reported against the models above rather than as a list of
+    # profiles: the question is "what can *this* agent not do", not
+    # "what profiles exist".
+    profiles: dict[str, Any] = {}
+    try:
+        raw = agent_config.get_providers_config().harness_profiles
+        if isinstance(raw, dict):
+            profiles = raw
+    except Exception:
+        logger.debug("Could not read harness profiles", exc_info=True)
+
+    for entry in entries:
+        profile = profiles.get(entry["name"])
+        if profile is None:
+            continue
+        # Parsed models, not dicts — `get_raw_section` does not exist
+        # and the first version read nothing at all, which an
+        # `except Exception` turned into "no exclusions" rather than
+        # into an error.
+        excluded_tools = [
+            str(t) for t in (getattr(profile, "excluded_tools", None) or [])
+        ]
+        excluded_middleware = [
+            str(m) for m in (getattr(profile, "excluded_middleware", None) or [])
+        ]
+        if excluded_tools:
+            entry["excluded_tools"] = sorted(excluded_tools)
+        if excluded_middleware:
+            entry["excluded_middleware"] = sorted(excluded_middleware)
+
+    routing: dict[str, Any] = {"enabled": False, "tiers": []}
+    try:
+        from deep_agent.src.routing.config import load_router_config
+
+        router_cfg = load_router_config()
+        routing = {
+            "enabled": bool(router_cfg.enabled),
+            "strategy": router_cfg.strategy,
+            "tiers": [
+                {
+                    "tier": tier.name,
+                    "name": tier.model,
+                    "provider": _provider_of(tier.model),
+                    "criteria": tier.criteria,
+                }
+                for tier in router_cfg.tiers
+            ],
+        }
+    except Exception:
+        logger.debug("Could not read the router config", exc_info=True)
+
+    return {"models": entries, "routing": routing}
+
+
+@router.get("/safeguards")
+async def list_safeguards() -> dict[str, Any]:
+    """What is applied to a message besides the model.
+
+    PII scrubbing, guardrails and the token budget all change what
+    the model sees or what comes back, and all of them are silent:
+    a redacted input looks like the text you typed, a filtered reply
+    looks like an ordinary one, and a run stopped by the budget looks
+    like a model with little to say.
+
+    Ungated, like the rest of Components. "Is what I type being
+    redacted before it reaches the model" is a question the person
+    typing is entitled to have answered, and answering it only for
+    operators is the same as not answering it.
+
+    State and scope, never values: which entity classes are matched,
+    not the patterns; that a guardrail model is configured, not where
+    it lives.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    # The typed accessors, not get_raw_section: pii lives in its own
+    # file and guardrails and the budget are parsed into models, so
+    # reading raw sections returned empty for all three and reported
+    # "nothing is on" for a config where things were.
+    def _read(fn: str, default: Any) -> Any:
+        try:
+            return getattr(agent_config, fn)()
+        except Exception:
+            logger.debug("Could not read config via %s", fn, exc_info=True)
+            return default
+
+    pii = _read("get_custom_pii_config", None)
+    guardrail = _read("get_guardrails_config", None)
+    budget = _read("get_token_budget_config", None)
+
+    return {
+        "pii": {
+            "enabled": bool(getattr(pii, "enabled", False)),
+            # What is matched, not how. A redaction pattern is a map
+            # of what evades it.
+            "entities": sorted(
+                str(rule.name)
+                for rule in (getattr(pii, "rules", None) or [])
+                if rule.name
+            ),
+            # Applies to traces rather than to the model's input, and
+            # the difference matters to anyone reading this.
+            "trace_strategy": str(getattr(pii, "trace_strategy", "") or ""),
+        },
+        # Just the switch. A "model configured" flag looked useful
+        # and would have been wrong: the loader drops `model` when
+        # guardrails are disabled, so it reported "none configured"
+        # for a config that names one.
+        "guardrail": {"enabled": bool(getattr(guardrail, "enabled", False))},
+        "token_budget": {"enabled": bool(getattr(budget, "enabled", False))},
+    }
+
+
+@router.get("/permissions")
+async def list_permissions() -> dict[str, Any]:
+    """What this agent is allowed to do.
+
+    Three rules decide whether an action happens, and none of them
+    were visible: whether a tool runs unattended, pauses for a
+    decision or is refused; whether the agent is in dry run and
+    therefore cannot act at all; and which paths it may read or
+    write.
+
+    Dry run is the one that most needs saying. Every tool that would
+    have asked is refused instead, so the agent investigates and
+    proposes and changes nothing — and from the outside that is
+    indistinguishable from an agent whose tools are broken.
+
+    Patterns and decisions only. No arguments, no paths outside the
+    configured roots, nothing about what has actually been run.
+    """
+    from deep_agent.src.agent.config import agent_config
+
+    def _read(fn: str) -> Any:
+        try:
+            return getattr(agent_config, fn)()
+        except Exception:
+            logger.debug("Could not read config via %s", fn, exc_info=True)
+            return None
+
+    middleware = _read("get_middleware_config")
+    approval = getattr(getattr(middleware, "defaults", None), "human_approval", None)
+    filesystem = _read("get_filesystem_config")
+
+    # admin_routes already resolves this, including the fallback for
+    # an invalid block. A second copy here is how the two come to
+    # disagree about whether the agent can act.
+    from deep_agent.aegra.admin_routes import _effects_mode
+
+    try:
+        effects = _effects_mode()
+    except Exception:
+        logger.debug("Could not read the effects mode", exc_info=True)
+        effects = "live"
+
+    policies = [
+        {
+            "tools": sorted(str(t) for t in (getattr(policy, "tools", None) or [])),
+            "decision": str(getattr(policy, "decision", "ask")),
+            "risk": str(getattr(policy, "risk", "medium")),
+            "reason": str(getattr(policy, "reason", "") or ""),
+        }
+        for policy in (getattr(approval, "policies", None) or [])
+    ]
+
+    # `exclude` predates policies and still means "never prompt".
+    # Presented as what it is rather than as a separate concept
+    # nobody reading the page would know to ask about.
+    never_asks = sorted(str(p) for p in (getattr(approval, "exclude", None) or []))
+
+    rules = []
+    for rule in getattr(filesystem, "permissions", None) or []:
+        rules.append(
+            {
+                "operations": sorted(
+                    str(o) for o in (getattr(rule, "operations", None) or [])
+                ),
+                "paths": sorted(str(p) for p in (getattr(rule, "paths", None) or [])),
+                "mode": str(getattr(rule, "mode", "") or ""),
+            }
+        )
+
+    return {
+        "approval": {
+            "enabled": bool(getattr(approval, "enabled", True)),
+            "default_decision": str(getattr(approval, "default_decision", "ask")),
+            "policies": policies,
+            "never_asks": never_asks,
+        },
+        # Flat rather than nested under approval: dry run is enforced
+        # through the approval policy but it is not an approval
+        # setting, and burying it reads as a detail of one.
+        "effects": effects,
+        "dry_run": effects == "dry_run",
+        "filesystem": {"rules": rules},
+    }
 
 
 @router.get("/auth/whoami")

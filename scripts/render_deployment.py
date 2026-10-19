@@ -45,6 +45,7 @@ COMPONENT_PATHS = {
     "scaleToZero": "../../components/scale-to-zero",
     "externalChannels": "../../components/external-channels",
     "documentsPvc": "../../components/documents-pvc",
+    "configPvc": "../../components/config-pvc",
 }
 
 BANNER = (
@@ -131,6 +132,50 @@ def _probes(probes: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _pod_labels(values: dict[str, Any]) -> dict[str, str]:
+    """The recommended Kubernetes labels, for the pod template.
+
+    Not the `app`/`component` pair already on the Deployment: those are
+    the selector, and a selector cannot be changed on a live workload.
+    These go on the pod template only, which is where log and metric
+    collectors read service identity from.
+
+    `version` is the one that earns its place. Without it a metrics
+    backend cannot split a series by release, so "did the rollout cause
+    this" is answered by eye against a deploy timestamp.
+    """
+    labels = {
+        "app.kubernetes.io/name": _get(values, "app.serviceName")
+        or _get(values, "app.name", "agent"),
+        "app.kubernetes.io/component": _get(values, "app.component", "agent"),
+        "app.kubernetes.io/version": str(_get(values, "image.tag", "latest")),
+        "app.kubernetes.io/part-of": _get(values, "app.partOf"),
+        "app.kubernetes.io/managed-by": "kustomize",
+    }
+    return {k: str(v) for k, v in labels.items() if v}
+
+
+def _rollout(values: dict[str, Any]) -> dict[str, Any]:
+    """Deployment-level rollout fields from the `rollout:` block."""
+    rollout = _get(values, "rollout", {}) or {}
+    spec: dict[str, Any] = {}
+
+    surge = rollout.get("maxSurge")
+    unavailable = rollout.get("maxUnavailable")
+    if surge is not None or unavailable is not None:
+        rolling: dict[str, Any] = {}
+        if surge is not None:
+            rolling["maxSurge"] = surge
+        if unavailable is not None:
+            rolling["maxUnavailable"] = unavailable
+        spec["strategy"] = {"type": "RollingUpdate", "rollingUpdate": rolling}
+
+    for field in ("minReadySeconds", "progressDeadlineSeconds"):
+        if rollout.get(field) is not None:
+            spec[field] = int(rollout[field])
+    return spec
+
+
 def _agent_patch(values: dict[str, Any]) -> dict[str, Any] | None:
     """Replicas, resources and probes on the agent Deployment.
 
@@ -145,14 +190,39 @@ def _agent_patch(values: dict[str, Any]) -> dict[str, Any] | None:
         container["resources"] = resources
     container.update(_probes(_get(values, "probes", {}) or {}))
 
-    spec: dict[str, Any] = {}
+    drain = _get(values, "drain", {}) or {}
+    pod_spec: dict[str, Any] = {}
+    grace = drain.get("terminationGracePeriodSeconds")
+    if grace is not None:
+        pod_spec["terminationGracePeriodSeconds"] = int(grace)
+    delay = drain.get("preStopSleepSeconds")
+    if delay is not None:
+        # Endpoint removal and the TERM signal race. Kubernetes sends
+        # both at once, and a pod that begins shutting down before the
+        # router has stopped sending it traffic drops the requests
+        # arriving in between. Sleeping in preStop holds the container
+        # open while the removal propagates; shutdown starts after.
+        container["lifecycle"] = {
+            "preStop": {"exec": {"command": ["sleep", str(int(delay))]}}
+        }
+
+    spec: dict[str, Any] = _rollout(values)
     replicas = _get(values, "app.replicas")
     if replicas is not None and not _get(values, "components.scaleToZero", False):
         # Patches apply after components, so a replica count here would
         # overwrite the 0 that scale-to-zero exists to set.
         spec["replicas"] = int(replicas)
     if len(container) > 1:
-        spec["template"] = {"spec": {"containers": [container]}}
+        pod_spec["containers"] = [container]
+
+    template: dict[str, Any] = {}
+    labels = _pod_labels(values)
+    if labels:
+        template["metadata"] = {"labels": labels}
+    if pod_spec:
+        template["spec"] = pod_spec
+    if template:
+        spec["template"] = template
 
     if not spec:
         return None
@@ -187,26 +257,75 @@ def _hpa_patch(values: dict[str, Any]) -> dict[str, Any] | None:
 
     # metrics is a list, so strategic merge replaces it wholesale rather
     # than merging element-wise. Emit the complete list or not at all.
-    cpu = autoscaling.get("targetCPUUtilizationPercentage")
-    memory = autoscaling.get("targetMemoryUtilizationPercentage")
-    if cpu is not None and memory is not None:
-        spec["metrics"] = [
+    #
+    # Each target is optional and omitting one drops that metric. That
+    # matters for memory: the HPA acts on the *highest* recommendation
+    # across its metrics, so a target on a signal that does not track
+    # load does not sit harmlessly alongside the others — it overrides
+    # them. Memory here is a static footprint, resident before the
+    # first request, and a target on it held the fleet at maxReplicas
+    # permanently.
+    metrics: list[dict[str, Any]] = []
+    for name, target in (
+        ("cpu", autoscaling.get("targetCPUUtilizationPercentage")),
+        ("memory", autoscaling.get("targetMemoryUtilizationPercentage")),
+    ):
+        if target is None:
+            continue
+        metrics.append(
             {
                 "type": "Resource",
                 "resource": {
                     "name": name,
                     "target": {
                         "type": "Utilization",
-                        "averageUtilization": int(value),
+                        "averageUtilization": int(target),
                     },
                 },
             }
-            for name, value in (("cpu", cpu), ("memory", memory))
-        ]
+        )
 
-    window = (autoscaling.get("scaleDown") or {}).get("stabilizationWindowSeconds")
+    in_flight = autoscaling.get("targetRunsInFlightPerPod")
+    if in_flight is not None:
+        # The metric that actually tracks saturation. An agent turn
+        # waits on a model for almost all of its wall-clock time, so a
+        # pod can hold a hundred concurrent runs at fifteen percent
+        # CPU — neither resource metric crosses its target under the
+        # load that exhausts the connection pools and the event loop.
+        # Published by deep_agent/aegra/inflight_metrics.py.
+        metrics.append(
+            {
+                "type": "Pods",
+                "pods": {
+                    "metric": {"name": "aegra_runs_in_flight"},
+                    "target": {
+                        "type": "AverageValue",
+                        "averageValue": str(in_flight),
+                    },
+                },
+            }
+        )
+
+    if metrics:
+        spec["metrics"] = metrics
+
+    scale_down = autoscaling.get("scaleDown") or {}
+    window = scale_down.get("stabilizationWindowSeconds")
     if window is not None:
-        spec["behavior"] = {"scaleDown": {"stabilizationWindowSeconds": int(window)}}
+        behavior: dict[str, Any] = {
+            "scaleDown": {"stabilizationWindowSeconds": int(window)}
+        }
+        percent = scale_down.get("percentPerMinute")
+        if percent is not None:
+            # Retire pods slowly. Every pod removed is a set of runs
+            # that must drain or be resumed elsewhere, so a burst of
+            # scale-down during a lull is how long-running work gets
+            # interrupted for no reason.
+            behavior["scaleDown"]["policies"] = [
+                {"type": "Percent", "value": int(percent), "periodSeconds": 60}
+            ]
+            behavior["scaleDown"]["selectPolicy"] = "Min"
+        spec["behavior"] = behavior
 
     if not spec:
         return None
@@ -339,9 +458,51 @@ def ensure_patch_reference(kustomization: str) -> str:
     return kustomization.rstrip("\n") + f"\n\npatches:\n  - path: {GENERATED_FILE}\n"
 
 
+TUNING_CONFIGMAP = REPO_ROOT / "deployment" / "base" / "configmap-tuning.yaml"
+
+
+def render_tuning_configmap(values: dict[str, Any]) -> str:
+    """The capacity ConfigMap, generated from the `tuning:` block.
+
+    Kept out of `agent-config` so it can be consumed with `envFrom`.
+    The agent container lists agent-config keys one at a time on
+    purpose — an unlisted key must not reach the pod — but applying
+    that to a dozen related bounds is a hundred lines of boilerplate
+    in which one missed entry silently restores a library default.
+    Everything here is a pool bound or a timeout.
+
+    Generated rather than hand-written because a tuning value that
+    disagrees between values.yaml and the manifest is a value nobody
+    can reason about, and the whole point of these numbers is that
+    they are reasoned about together.
+    """
+    tuning = _get(values, "tuning", {}) or {}
+    body = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "agent-tuning",
+            "labels": {"app": "agent", "component": "agent"},
+        },
+        "data": {k: str(v) for k, v in tuning.items()},
+    }
+    header = (
+        "# Generated by scripts/render_deployment.py from the\n"
+        "# `tuning:` block of config/agent/deployment/values.yaml.\n"
+        "# Do not edit; run `make render-deployment`.\n"
+        "#\n"
+        "# These are pool bounds and timeouts. Each multiplies by the\n"
+        "# pod count and shares the server's max_connections with\n"
+        "# everything else on that database, so they are set together,\n"
+        "# not individually. The arithmetic is in docs/scalability.md.\n"
+    )
+    return header + yaml.safe_dump(body, sort_keys=False, default_flow_style=False)
+
+
 def plan(values: dict[str, Any]) -> dict[Path, str]:
     """Every file this would write, mapped to its intended contents."""
     out: dict[Path, str] = {}
+    out[TUNING_CONFIGMAP] = render_tuning_configmap(values)
     for target in BUILDERS:
         overlay = REPO_ROOT / "deployment" / "overlays" / target
         if not overlay.is_dir():

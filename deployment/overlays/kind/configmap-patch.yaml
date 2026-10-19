@@ -12,9 +12,14 @@ data:
   SSO_DEV_USERNAME: "Kind Dev"
   SSO_DEV_USER_ID: "kind-dev-user"
 
-  # Point every model at the in-cluster stub (mock-llm.yaml). `mock-model` is
-  # in neither GEMINI_MODELS nor CLAUDE_MODELS, so create_model() routes it to
-  # VLLM_BASE_URL. Without this the agent needs Vertex AI credentials that a
-  # local cluster has no business holding.
-  MODEL_OVERRIDE: "mock-model"
-  VLLM_BASE_URL: "http://mock-llm:8000/v1"
+  # No MODEL_OVERRIDE. The in-cluster stub is gone, so the agent calls
+  # whatever `runtime/agent.yaml` names — which means this cluster now
+  # needs real model credentials to answer anything. Everything that
+  # does not call a model (config, skills, documents, MCP discovery,
+  # analytics) works without them.
+  #
+  # To go back to a stub: restore mock-llm.yaml and set
+  #   MODEL_OVERRIDE: "mock-model"
+  #   VLLM_BASE_URL: "http://mock-llm:8000/v1"
+  # `mock-model` matches no provider prefix, so create_model() routes
+  # it to VLLM_BASE_URL.

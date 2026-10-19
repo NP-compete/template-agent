@@ -3,16 +3,34 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
+from psycopg.rows import tuple_row
 
 import deep_agent.aegra.eval_routes as er
 from deep_agent.aegra.auth import DEV_USER_ID
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+
+def _conn_cm(conn):
+    """Stand in for ``_pg_conn``, which is sync and returns an async CM.
+
+    It used to be an async function returning a freshly opened
+    connection, so tests patched it with ``AsyncMock(return_value=…)``.
+    It now borrows from the shared pool, and the thing callers enter is
+    the context manager rather than the connection.
+    """
+
+    @asynccontextmanager
+    async def _cm():
+        yield conn
+
+    return Mock(side_effect=_cm)
 
 
 class _AsyncCursor:
@@ -49,6 +67,15 @@ def _make_conn(cursor=None):
     conn.close = AsyncMock()
     conn.__aenter__ = AsyncMock(return_value=conn)
     conn.__aexit__ = AsyncMock(return_value=False)
+
+    # DDL runs inside a transaction now, so that `SET LOCAL
+    # statement_timeout` reverts rather than following the pooled
+    # connection to its next borrower.
+    @asynccontextmanager
+    async def _txn():
+        yield None
+
+    conn.transaction = Mock(side_effect=_txn)
     return conn, cur
 
 
@@ -336,25 +363,36 @@ class TestRequireEvalCases:
 
 
 class TestEnsureEvalsTable:
+    # Each DDL statement runs in its own transaction, preceded by a
+    # `SET LOCAL statement_timeout` — two execute calls per statement.
+    @staticmethod
+    def _expected_calls():
+        return len(er._EVALS_DDL_STATEMENTS) * 2
+
     async def test_executes_all_ddl_statements(self):
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._ensure_evals_table()
-        # +1 for the SET statement_timeout call prepended before DDL statements
-        assert conn.execute.call_count == len(er._EVALS_DDL_STATEMENTS) + 1
-        conn.close.assert_called_once()
+        assert conn.execute.call_count == self._expected_calls()
 
-    async def test_closes_on_ddl_failure(self):
+    async def test_does_not_close_the_pooled_connection(self):
+        """The connection is borrowed, so returning it is the pool's job.
+
+        Closing it here would take a connection out of the pool on
+        every call, which is the opposite of what pooling is for.
+        """
         conn, _ = _make_conn()
-        conn.execute.side_effect = [Exception("DDL failed")]
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
+            await er._ensure_evals_table()
+        conn.close.assert_not_called()
+
+    async def test_propagates_ddl_failure(self):
+        conn, _ = _make_conn()
+        # First call is the SET LOCAL; the DDL after it fails.
+        conn.execute.side_effect = [AsyncMock(), Exception("DDL failed")]
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(Exception, match="DDL failed"):
                 await er._ensure_evals_table()
-        conn.close.assert_called_once()
 
     async def test_unique_violation_is_ignored(self):
         """UniqueViolation (concurrent workers racing on index creation) should
@@ -362,28 +400,23 @@ class TestEnsureEvalsTable:
         import psycopg.errors
 
         conn, _ = _make_conn()
-        # statement_timeout call succeeds, first DDL raises UniqueViolation, rest succeed
+        # SET LOCAL, then the first DDL raises; the rest succeed.
         unique_err = psycopg.errors.UniqueViolation()
         conn.execute.side_effect = [AsyncMock(), unique_err] + [AsyncMock()] * (
-            len(er._EVALS_DDL_STATEMENTS) - 1
+            self._expected_calls() - 2
         )
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             # Should not raise
             await er._ensure_evals_table()
-        conn.close.assert_called_once()
 
     async def test_ensure_once_idempotent(self):
         er._table_ensured = False
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._ensure_evals_table_once()
             await er._ensure_evals_table_once()
-        # Second call must not hit DB; +1 for SET statement_timeout
-        assert conn.execute.call_count == len(er._EVALS_DDL_STATEMENTS) + 1
+        # Second call must not hit the database.
+        assert conn.execute.call_count == self._expected_calls()
         er._table_ensured = False  # restore
 
 
@@ -398,9 +431,7 @@ class TestAtomicSetInProgress:
         cursor = _make_cursor(rows=[existing_row], description=cols)
         conn, _ = _make_conn(cursor)
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             doc, is_new = await er._atomic_set_in_progress("abc123", force=False)
 
         assert is_new is False
@@ -413,9 +444,7 @@ class TestAtomicSetInProgress:
         cursor = _make_cursor(rows=[("in_progress",)], description=cols)
         conn, _ = _make_conn(cursor)
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             doc, is_new = await er._atomic_set_in_progress("abc123", force=True)
 
         assert doc is None
@@ -440,9 +469,7 @@ class TestAtomicSetInProgress:
         conn.__aenter__ = AsyncMock(return_value=conn)
         conn.__aexit__ = AsyncMock(return_value=False)
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             doc, is_new = await er._atomic_set_in_progress("abc123", force=False)
 
         assert is_new is True
@@ -474,9 +501,7 @@ class TestEvalStatus:
             "deep_agent.aegra.eval_routes._has_postgres_dataset",
             AsyncMock(return_value=True),
         ):
-            with patch(
-                "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-            ):
+            with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
                 result = await er.eval_status()
 
         assert result["eval_status"] == "not_started"
@@ -495,9 +520,7 @@ class TestEvalStatus:
             "deep_agent.aegra.eval_routes._has_postgres_dataset",
             AsyncMock(return_value=True),
         ):
-            with patch(
-                "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-            ):
+            with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
                 result = await er.eval_status()
 
         assert result["eval_status"] == "completed"
@@ -521,9 +544,7 @@ class TestEvalResults:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(HTTPException) as exc:
                 await er.eval_results(mock_request)
         assert exc.value.status_code == 404
@@ -539,9 +560,7 @@ class TestEvalResults:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_results(mock_request)
 
         assert result["eval_status"] == "completed"
@@ -557,9 +576,7 @@ class TestEvalResults:
         mock_request = MagicMock()
         mock_request.query_params = {"completed_at": "2025-01-01T00:00:00"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_results(mock_request)
 
         assert result["eval_status"] == "completed"
@@ -593,9 +610,7 @@ class TestEvalHistory:
         mock_request = MagicMock()
         mock_request.query_params = {"limit": "10"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_history(mock_request)
 
         assert result["total"] == 3
@@ -612,9 +627,7 @@ class TestEvalHistory:
         mock_request = MagicMock()
         mock_request.query_params = {"limit": "9999"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er.eval_history(mock_request)
 
         # Query should have been called with limit=100, not 9999
@@ -638,9 +651,7 @@ class TestEvalTrends:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_trends(mock_request)
 
         assert "custom:tool_eval" in result["metrics"]
@@ -658,9 +669,7 @@ class TestEvalTrends:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_trends(mock_request)
 
         assert result["metrics"] == {}
@@ -787,7 +796,7 @@ class TestTriggerEval:
             ):
                 with patch(
                     "deep_agent.aegra.eval_routes._pg_conn",
-                    AsyncMock(return_value=conn),
+                    _conn_cm(conn),
                 ):
                     result = await er.trigger_eval(mock_request)
 
@@ -836,7 +845,7 @@ class TestTriggerEval:
             ):
                 with patch(
                     "deep_agent.aegra.eval_routes._pg_conn",
-                    AsyncMock(return_value=conn),
+                    _conn_cm(conn),
                 ):
                     with patch(
                         "deep_agent.aegra.eval_routes._fire_eval_run",
@@ -880,7 +889,7 @@ class TestTriggerEval:
             ):
                 with patch(
                     "deep_agent.aegra.eval_routes._pg_conn",
-                    AsyncMock(return_value=conn),
+                    _conn_cm(conn),
                 ):
                     result = await er.trigger_eval(mock_request)
 
@@ -948,7 +957,7 @@ class TestForceTriggerEval:
             ):
                 with patch(
                     "deep_agent.aegra.eval_routes._pg_conn",
-                    AsyncMock(return_value=conn),
+                    _conn_cm(conn),
                 ):
                     with patch(
                         "deep_agent.aegra.eval_routes._fire_eval_run",
@@ -967,24 +976,27 @@ class TestForceTriggerEval:
 
 
 class TestPgConn:
-    async def test_returns_connection(self):
+    async def test_borrows_from_the_shared_pool(self):
+        """No longer opens its own connection.
+
+        It used to call ``AsyncConnection.connect`` per request, at
+        sixteen call sites, which is a handshake each time and a
+        backend counted in nobody's pool budget.
+        """
         mock_conn = AsyncMock()
-        mock_settings = MagicMock()
-        mock_settings.database_uri = "postgresql://localhost/test"
 
-        mock_psycopg = MagicMock()
-        mock_psycopg.AsyncConnection.connect = AsyncMock(return_value=mock_conn)
+        @asynccontextmanager
+        async def fake_connection(row_factory=None):
+            fake_connection.row_factory = row_factory
+            yield mock_conn
 
-        with (
-            patch.dict("sys.modules", {"psycopg": mock_psycopg}),
-            patch("deep_agent.src.settings.settings", mock_settings),
-        ):
-            conn = await er._pg_conn()
+        with patch("deep_agent.src.db.pool.connection", fake_connection):
+            async with er._pg_conn() as conn:
+                assert conn is mock_conn
 
-        mock_psycopg.AsyncConnection.connect.assert_awaited_once_with(
-            "postgresql://localhost/test"
-        )
-        assert conn is mock_conn
+        # Rows here are read positionally, so the pool's dict_row
+        # default has to be overridden for the checkout.
+        assert fake_connection.row_factory is tuple_row
 
 
 # ── get_thread_tool_calls endpoint ────────────────────────────────────────────
@@ -1046,7 +1058,7 @@ class TestVerifyThreadOwnership:
             patch("deep_agent.aegra.eval_routes._extract_sub", return_value="user-a"),
             patch(
                 "deep_agent.aegra.eval_routes._pg_conn",
-                AsyncMock(return_value=conn),
+                _conn_cm(conn),
             ),
         ):
             with pytest.raises(HTTPException) as exc:
@@ -1062,7 +1074,7 @@ class TestVerifyThreadOwnership:
             patch("deep_agent.aegra.eval_routes._extract_sub", return_value="user-a"),
             patch(
                 "deep_agent.aegra.eval_routes._pg_conn",
-                AsyncMock(return_value=conn),
+                _conn_cm(conn),
             ),
         ):
             await er._verify_thread_ownership("thread-1", mock_request)
@@ -1807,9 +1819,7 @@ class TestMarkEvalError:
     async def test_updates_postgres(self):
         now = datetime(2025, 1, 1, tzinfo=UTC)
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._mark_eval_error("hash1", "some error", now)
         conn.execute.assert_called_once()
 
@@ -1939,9 +1949,7 @@ class TestUpsertDataset:
         mock_request = MagicMock()
         mock_request.headers = {"authorization": "Bearer fake-token"}
         with (
-            patch(
-                "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-            ),
+            patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)),
             patch(
                 "deep_agent.aegra.eval_routes._extract_username",
                 return_value="test-user",
@@ -2028,7 +2036,7 @@ class TestUpsertDataset:
             conn, _ = _make_conn()
             with patch(
                 "deep_agent.aegra.eval_routes._pg_conn",
-                AsyncMock(return_value=conn),
+                _conn_cm(conn),
             ):
                 result = await er.upsert_dataset(body, request=mock_request)
             assert result["status"] == "ok"
@@ -2042,9 +2050,7 @@ class TestUpsertDataset:
         mock_request = MagicMock()
         mock_request.headers = {"authorization": "Bearer fake-token"}
         with (
-            patch(
-                "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-            ),
+            patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)),
             patch(
                 "deep_agent.aegra.eval_routes._extract_username",
                 return_value="test-user",
@@ -2069,9 +2075,7 @@ class TestGetDataset:
             rows=[(case, "gpt-4", now)],
         )
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.get_dataset()
         assert result["dataset"] == {"cases": [case]}
         assert result["judge_model"] == "gpt-4"
@@ -2088,9 +2092,7 @@ class TestGetDataset:
             rows=[(case1, "gpt-4", now), (case2, "gpt-4", now)],
         )
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.get_dataset()
         assert result["dataset"]["cases"] == [case1, case2]
         assert result["judge_model"] == "gpt-4"
@@ -2102,9 +2104,7 @@ class TestGetDataset:
         er._dataset_items_table_ensured = True
         cursor = _make_cursor(rows=[])
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.get_dataset()
         assert result == {
             "dataset": {"cases": []},
@@ -2123,9 +2123,7 @@ class TestGetDataset:
             rows=[(case_str, None, now)],
         )
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.get_dataset()
         assert result["dataset"]["cases"][0]["query"] == "hi"
         er._datasets_table_ensured = False
@@ -2138,9 +2136,7 @@ class TestHasPostgresDataset:
         er._dataset_items_table_ensured = True
         cursor = _make_cursor(rows=[(1,)])
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er._has_postgres_dataset()
         assert result is True
         er._datasets_table_ensured = False
@@ -2151,9 +2147,7 @@ class TestHasPostgresDataset:
         er._dataset_items_table_ensured = True
         cursor = _make_cursor(rows=[])
         conn, _ = _make_conn(cursor)
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er._has_postgres_dataset()
         assert result is False
         er._datasets_table_ensured = False
@@ -2176,9 +2170,7 @@ class TestEnsureDatasetsTableOnce:
     async def test_idempotent(self):
         er._datasets_table_ensured = False
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._ensure_datasets_table_once()
             first_count = conn.execute.call_count
             await er._ensure_datasets_table_once()
@@ -2191,9 +2183,7 @@ class TestEnsureDatasetItemsTableOnce:
         er._datasets_table_ensured = False
         er._dataset_items_table_ensured = False
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._ensure_dataset_items_table_once()
             first_count = conn.execute.call_count
             await er._ensure_dataset_items_table_once()
@@ -2205,9 +2195,7 @@ class TestEnsureDatasetItemsTableOnce:
         er._datasets_table_ensured = False
         er._dataset_items_table_ensured = False
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._ensure_dataset_items_table_once()
         assert er._datasets_table_ensured is False
         assert er._dataset_items_table_ensured is True
@@ -2239,9 +2227,7 @@ class TestRunDdlOnce:
     async def test_runs_ddl_and_sets_flag(self):
         er._datasets_table_ensured = False
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._run_ddl_once(
                 "CREATE TABLE test (id INT)",
                 ["ALTER TABLE test ADD COLUMN name TEXT"],
@@ -2255,9 +2241,7 @@ class TestRunDdlOnce:
         er._datasets_table_ensured = False
         conn, _ = _make_conn()
         conn.execute = AsyncMock(side_effect=Exception("DDL error"))
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(Exception, match="DDL error"):
                 await er._run_ddl_once(
                     "CREATE TABLE bad",
@@ -2270,9 +2254,7 @@ class TestRunDdlOnce:
     async def test_skips_when_flag_already_set(self):
         er._datasets_table_ensured = True
         conn, _ = _make_conn()
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._run_ddl_once(
                 "CREATE TABLE test (id INT)",
                 [],
@@ -2288,17 +2270,19 @@ class TestRunDdlOnce:
         er._datasets_table_ensured = False
         conn, _ = _make_conn()
         ok_result = AsyncMock()
+        # Each statement is preceded by its own SET LOCAL, inside the
+        # per-statement transaction.
         conn.execute = AsyncMock(
             side_effect=[
-                ok_result,  # SET statement_timeout
+                ok_result,  # SET LOCAL
                 ok_result,  # DDL
+                ok_result,  # SET LOCAL
                 ok_result,  # first migration succeeds
+                ok_result,  # SET LOCAL
                 psycopg.errors.UndefinedTable("eval_datasets"),  # second migration
             ]
         )
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             await er._run_ddl_once(
                 "CREATE TABLE test (id INT)",
                 ["ALTER OK", "MIGRATION REFERENCING OLD TABLE"],
@@ -2315,9 +2299,7 @@ class TestRunDdlOnce:
         conn.execute = AsyncMock(
             side_effect=[ok_result, ok_result, RuntimeError("transient db error")]
         )
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(RuntimeError, match="transient db error"):
                 await er._run_ddl_once(
                     "CREATE TABLE test (id INT)",
@@ -2343,9 +2325,7 @@ class TestEvalStatusUndefinedTable:
                 "deep_agent.aegra.eval_routes._has_postgres_dataset",
                 AsyncMock(return_value=True),
             ),
-            patch(
-                "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-            ),
+            patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)),
         ):
             result = await er.eval_status()
         assert result["eval_status"] == "no_dataset"
@@ -2367,9 +2347,7 @@ class TestEvalResultsUndefinedTable:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(HTTPException) as exc:
                 await er.eval_results(mock_request)
         assert exc.value.status_code == 404
@@ -2390,9 +2368,7 @@ class TestEvalHistoryUndefinedTable:
         mock_request = MagicMock()
         mock_request.query_params = {"limit": "10"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_history(mock_request)
         assert result == {"runs": [], "total": 0}
         assert er._table_ensured is False
@@ -2421,9 +2397,7 @@ class TestEvalTrendsErrors:
         mock_request = MagicMock()
         mock_request.query_params = {"limit": "10"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_trends(mock_request)
         assert result == {"metrics": {}, "overall": []}
         assert er._table_ensured is False
@@ -2511,7 +2485,7 @@ class TestTriggerEvalMcpAuth:
             ),
             patch(
                 "deep_agent.aegra.eval_routes._pg_conn",
-                AsyncMock(return_value=conn),
+                _conn_cm(conn),
             ),
             patch(
                 "deep_agent.aegra.eval_routes._check_mcp_auth",
@@ -2577,9 +2551,7 @@ class TestAtomicSetInProgressRaceCondition:
             side_effect=[select_cursor, insert_cursor, recheck_cursor]
         )
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             doc, is_new = await er._atomic_set_in_progress("abc123", force=False)
 
         assert doc is None
@@ -2605,9 +2577,7 @@ class TestAtomicSetInProgressRaceCondition:
             side_effect=[select_cursor, insert_cursor, recheck_cursor]
         )
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             doc, is_new = await er._atomic_set_in_progress("abc123", force=False)
 
         assert doc is not None
@@ -2747,9 +2717,7 @@ class TestExportResults:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.export_results(mock_request)
 
         assert result["eval_score"] == 0.9
@@ -2790,9 +2758,7 @@ class TestExportResults:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(HTTPException) as exc:
                 await er.export_results(mock_request)
         assert exc.value.status_code == 404
@@ -2817,9 +2783,7 @@ class TestExportResults:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             with pytest.raises(HTTPException) as exc:
                 await er.export_results(mock_request)
         assert exc.value.status_code == 404
@@ -2857,9 +2821,7 @@ class TestExportResults:
         mock_request = MagicMock()
         mock_request.query_params = {"completed_at": "2025-06-01T00:00:00+00:00"}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.export_results(mock_request)
 
         assert result["eval_score"] == 0.8
@@ -2909,9 +2871,7 @@ class TestEvalResultsTurnFetching:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_results(mock_request)
 
         assert "turns" in result["results_detail"]
@@ -2934,9 +2894,7 @@ class TestEvalResultsTurnFetching:
         mock_request = MagicMock()
         mock_request.query_params = {}
 
-        with patch(
-            "deep_agent.aegra.eval_routes._pg_conn", AsyncMock(return_value=conn)
-        ):
+        with patch("deep_agent.aegra.eval_routes._pg_conn", _conn_cm(conn)):
             result = await er.eval_results(mock_request)
 
         assert result["results_detail"]["turns"] == [{"result": "PASS"}]

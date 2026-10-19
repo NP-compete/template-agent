@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from deep_agent.src.settings import settings
+
 # Anything outside this set is replaced. Deliberately narrow — a
 # filename only has to be readable, not expressive.
 _SAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
@@ -26,7 +28,7 @@ _RESERVED = {
     *(f"lpt{i}" for i in range(1, 10)),
 }
 
-MAX_NAME_LENGTH = 128
+MAX_NAME_LENGTH = settings.ATTACHMENT_MAX_NAME_LENGTH
 
 
 def sanitise_filename(raw: str) -> str:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -29,7 +30,7 @@ logger = get_python_logger()
 # Connection state is per user and lives in Redis. Re-reading it on
 # every model call would put a round trip in front of each turn, and
 # it changes only when somebody completes an OAuth flow.
-_CACHE_SECONDS = 60
+_CACHE_SECONDS = settings.MCP_STATUS_CACHE_SECONDS
 
 
 def build_notice(connected: list[str], unconnected: list[str]) -> str:
@@ -42,7 +43,8 @@ def build_notice(connected: list[str], unconnected: list[str]) -> str:
             "Not connected, so their tools will fail: "
             + ", ".join(sorted(unconnected))
             + ". If one of these is needed, tell the user to connect it in "
-            "Settings → MCP rather than calling it and reporting the error."
+            f"{settings.MCP_SETTINGS_PATH} rather than calling it and "
+            "reporting the error."
         )
     return "\n".join(lines)
 
@@ -64,7 +66,16 @@ async def connection_state(user_id: str) -> tuple[list[str], list[str]]:
         logger.debug("Could not read MCP connection state", exc_info=True)
         return [], []
 
-    connected = [e["mcp_name"] for e in entries if e.get("connected")]
+    # The connected list carries the account each integration is
+    # acting as. The same person is one identity in the agent and
+    # often another in the integration, and "who is my manager"
+    # answered from the agent's login quietly answers for the wrong
+    # person whenever those differ.
+    connected = [
+        f"{e['mcp_name']} (as {e['account']})" if e.get("account") else e["mcp_name"]
+        for e in entries
+        if e.get("connected")
+    ]
     unconnected = [e["mcp_name"] for e in entries if not e.get("connected")]
     return connected, unconnected
 
@@ -77,7 +88,8 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
     from langchain.agents.middleware.types import AgentMiddleware
     from langchain_core.messages import SystemMessage
 
-    cache: dict[str, tuple[float, str]] = {}
+    # (fetched_at, notice, unconnected server names)
+    cache: dict[str, tuple[float, str, tuple[str, ...]]] = {}
 
     async def _prime() -> None:
         """Fill the cache before the first model call needs it.
@@ -97,6 +109,7 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
                 cache[user_id] = (
                     time.monotonic(),
                     build_notice(connected, unconnected),
+                    tuple(unconnected),
                 )
         except Exception:
             logger.debug("Could not prime MCP status", exc_info=True)
@@ -112,7 +125,8 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
 
         async def awrap_model_call(self, request: Any, handler: Any) -> Any:
             notice = await self._notice(request)
-            return await handler(self._apply(request, notice))
+            response = await handler(self._apply(request, notice))
+            return self._offer_connect(response, self._unconnected(request))
 
         def wrap_model_call(self, request: Any, handler: Any) -> Any:
             # The sync path cannot await the connection lookup, and
@@ -122,7 +136,77 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
             user_id = self._user_id(request)
             cached = cache.get(user_id)
             notice = cached[1] if cached else ""
-            return handler(self._apply(request, notice))
+            response = handler(self._apply(request, notice))
+            return self._offer_connect(response, self._unconnected(request))
+
+        def _unconnected(self, request: Any) -> tuple[str, ...]:
+            hit = cache.get(self._user_id(request))
+            return hit[2] if hit and len(hit) > 2 else ()
+
+        @staticmethod
+        def _offer_connect(response: Any, unconnected: tuple[str, ...]) -> Any:
+            """Put a Connect button on a reply that declined for auth.
+
+            The button already existed, but it was only ever built
+            from a tool *failure*: something had to call an
+            unreachable server and raise. Told up front that
+            a server was not connected, the model correctly declined
+            without calling anything — so no failure was recorded, no
+            marker was emitted, and the reply sent the reader off to
+            a settings page instead of offering the one click that
+            fixes it.
+
+            Derived here instead of asked of the model. Telling it to
+            emit a marker was tried and it paraphrased the sentence
+            and dropped the marker, which is why provenance exists.
+            """
+            if not unconnected:
+                return response
+            try:
+                message: Any = getattr(response, "result", None)
+                if isinstance(message, list):
+                    message = message[0] if message else None
+                if message is None:
+                    return response
+
+                text = getattr(message, "text", "") or ""
+                if not isinstance(text, str) or not text:
+                    return response
+                haystack = text.lower()
+
+                named = [n for n in unconnected if n.lower() in haystack]
+                if not named:
+                    return response
+
+                extra = getattr(message, "additional_kwargs", None)
+                if not isinstance(extra, dict):
+                    extra = {}
+                    message.additional_kwargs = extra
+
+                # A tool failure is the better signal when both fire:
+                # it knows whether the grant expired or was never
+                # made. Only fill gaps it left.
+                existing = extra.get("auth_required")
+                requests = list(existing) if isinstance(existing, list) else []
+                already = {r.get("mcp_name") for r in requests if isinstance(r, dict)}
+                for name in named:
+                    if name in already:
+                        continue
+                    requests.append({"mcp_name": name, "reason": "not_connected"})
+
+                # Then keep only what this answer is about. Shared
+                # with the tool-failure path so that whichever
+                # middleware writes last reaches the same answer.
+                from deep_agent.aegra.mcp_tool_auth import narrow_auth_requests
+
+                requests = narrow_auth_requests(requests, text)
+                if requests:
+                    extra["auth_required"] = requests
+            except Exception:
+                # A missing button is a worse answer; a failed turn is
+                # no answer.
+                logger.debug("Could not offer connect action", exc_info=True)
+            return response
 
         @staticmethod
         def _user_id(request: Any) -> str:
@@ -173,7 +257,7 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
                 if (connected or unconnected)
                 else ""
             )
-            cache[user_id] = (now, notice)
+            cache[user_id] = (now, notice, tuple(unconnected))
             return notice
 
         @staticmethod

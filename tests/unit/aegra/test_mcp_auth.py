@@ -725,7 +725,7 @@ class TestRefreshScopeBaseline:
     A refresh request carries no `scope` parameter, so RFC 6749 §6
     keeps the scopes of the original grant. Validating the response
     against the discovery document's `scopes_supported` checks it
-    against something nobody requested — which is how Dataverse, which
+    against something nobody requested — which is how the warehouse server, which
     advertises `session:role-any` and grants `read write`, failed every
     refresh and dropped out an hour after each connect.
     """
@@ -735,7 +735,7 @@ class TestRefreshScopeBaseline:
         return McpOAuthToken(
             agent_name="test-agent",
             user_id="user-1",
-            mcp_name="dataverse",
+            mcp_name="warehouse",
             access_token="old-access",
             refresh_token="refresh-me",
             expires_at=datetime.now(UTC) - timedelta(minutes=5),
@@ -819,3 +819,165 @@ class TestRefreshScopeBaseline:
             discovery_scopes=["session:role-any"],
         )
         assert token == "new-access"
+
+
+class TestHasValidTokenVerification:
+    """The settings page and the chat must not disagree.
+
+    the warehouse server showed **Connected** on the MCP page while every chat
+    turn reported the session as expired. Both were reading the same
+    row: the access token had expired two hours earlier and only a
+    refresh token remained. ``has_valid_token`` treated its presence
+    as proof, the chat actually tried the refresh, and the refresh
+    was dead.
+    """
+
+    @staticmethod
+    def _expired_token() -> McpOAuthToken:
+        return McpOAuthToken(
+            agent_name="agent",
+            user_id="user-1",
+            mcp_name="warehouse",
+            access_token="stale",
+            refresh_token="rt",
+            expires_at=datetime.now(UTC) - timedelta(hours=2),
+            scopes=["read"],
+        )
+
+    @staticmethod
+    def _cfg() -> dict:
+        return {"auth_mode": "oauth", "oauth": {"token_endpoint": "https://x/token"}}
+
+    async def test_unverified_trusts_the_refresh_token(self):
+        store = AsyncMock()
+        store.get_token.return_value = self._expired_token()
+        resolver = McpCredentialResolver(token_store=store)
+
+        assert (
+            await resolver.has_valid_token("user-1", "warehouse", self._cfg()) is True
+        )
+
+    async def test_verified_reports_disconnected_when_the_refresh_is_dead(self):
+        store = AsyncMock()
+        store.get_token.return_value = self._expired_token()
+        resolver = McpCredentialResolver(token_store=store)
+
+        with patch.object(
+            resolver,
+            "resolve",
+            AsyncMock(side_effect=NeedsAuthorization("warehouse", "u")),
+        ):
+            result = await resolver.has_valid_token(
+                "user-1", "warehouse", self._cfg(), verify=True
+            )
+
+        assert result is False
+
+    async def test_verified_reports_connected_when_the_refresh_works(self):
+        store = AsyncMock()
+        store.get_token.return_value = self._expired_token()
+        resolver = McpCredentialResolver(token_store=store)
+
+        with patch.object(resolver, "resolve", AsyncMock(return_value="fresh")):
+            result = await resolver.has_valid_token(
+                "user-1", "warehouse", self._cfg(), verify=True
+            )
+
+        assert result is True
+
+    async def test_a_provider_outage_is_not_a_disconnected_integration(self):
+        store = AsyncMock()
+        store.get_token.return_value = self._expired_token()
+        resolver = McpCredentialResolver(token_store=store)
+
+        with patch.object(resolver, "resolve", AsyncMock(side_effect=TimeoutError())):
+            result = await resolver.has_valid_token(
+                "user-1", "warehouse", self._cfg(), verify=True
+            )
+
+        assert result is True
+
+
+class TestInvalidGrantDetection:
+    def test_reads_the_rfc_shape(self):
+        from deep_agent.aegra.mcp_auth import _is_invalid_grant
+
+        assert _is_invalid_grant('{"error": "invalid_grant"}') is True
+
+    def test_reads_the_nested_shape_warehouse_sends(self):
+        from deep_agent.aegra.mcp_auth import _is_invalid_grant
+
+        body = '{"detail":{"error":"invalid_grant","error_description":"Invalid refresh token"}}'
+        assert _is_invalid_grant(body) is True
+
+    def test_a_transient_server_error_is_not_a_dead_grant(self):
+        from deep_agent.aegra.mcp_auth import _is_invalid_grant
+
+        assert _is_invalid_grant('{"error": "temporarily_unavailable"}') is False
+        assert _is_invalid_grant("") is False
+        assert _is_invalid_grant("<html>502 Bad Gateway</html>") is False
+
+
+class TestDeadRefreshTokenIsCleared:
+    """A rejected refresh token must not be retried forever.
+
+    the warehouse server answers `invalid_grant` in ~9s. Left in the store, that
+    cost is paid again on every status check and every chat turn that
+    touches the integration, to be told the same thing each time.
+    """
+
+    @staticmethod
+    def _stored() -> McpOAuthToken:
+        return McpOAuthToken(
+            agent_name="agent",
+            user_id="user-1",
+            mcp_name="warehouse",
+            access_token="stale",
+            refresh_token="dead",
+            expires_at=datetime.now(UTC) - timedelta(hours=2),
+            scopes=["read", "write"],
+        )
+
+    async def test_clearing_keeps_the_row_and_drops_only_the_refresh_token(self):
+        store = AsyncMock()
+        resolver = McpCredentialResolver(token_store=store)
+
+        await resolver._clear_dead_refresh_token(self._stored())
+
+        kwargs = store.upsert_token.await_args.kwargs
+        assert kwargs["refresh_token"] is None
+        assert kwargs["access_token"] == "stale"
+        assert kwargs["mcp_name"] == "warehouse"
+        assert kwargs["scopes"] == ["read", "write"]
+
+    async def test_a_cleared_credential_then_reports_disconnected_without_a_round_trip(
+        self,
+    ):
+        cleared = McpOAuthToken(
+            agent_name="agent",
+            user_id="user-1",
+            mcp_name="warehouse",
+            access_token="stale",
+            refresh_token=None,
+            expires_at=datetime.now(UTC) - timedelta(hours=2),
+            scopes=["read"],
+        )
+        store = AsyncMock()
+        store.get_token.return_value = cleared
+        resolver = McpCredentialResolver(token_store=store)
+        cfg = {"auth_mode": "oauth", "oauth": {"token_endpoint": "https://x/token"}}
+
+        with patch.object(resolver, "resolve", AsyncMock()) as resolve:
+            result = await resolver.has_valid_token(
+                "user-1", "warehouse", cfg, verify=True
+            )
+
+        assert result is False
+        resolve.assert_not_called()
+
+    async def test_bookkeeping_failure_does_not_escape(self):
+        store = AsyncMock()
+        store.upsert_token.side_effect = RuntimeError("db down")
+        resolver = McpCredentialResolver(token_store=store)
+
+        await resolver._clear_dead_refresh_token(self._stored())

@@ -17,17 +17,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # A column with few distinct values is a vocabulary the agent should
 # know; past this it is free text and listing it is noise.
-CATEGORICAL_MAX_DISTINCT = 25
+CATEGORICAL_MAX_DISTINCT = settings.DATASET_CATEGORICAL_MAX_DISTINCT
 
 # Rows read for profiling. Enough to characterise, bounded so a large
 # file does not have to fit in memory.
-SAMPLE_ROWS = 50_000
+SAMPLE_ROWS = settings.DATASET_SAMPLE_ROWS
 
 
 @dataclass

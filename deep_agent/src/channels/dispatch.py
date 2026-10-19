@@ -29,11 +29,11 @@ logger = get_python_logger()
 # process-local cache, not a durability mechanism — Slack retries within
 # about a minute, well inside any sane bound.
 _SEEN_EVENTS: dict[str, float] = {}
-_SEEN_LIMIT = 2048
+_SEEN_LIMIT = settings.CHANNEL_SEEN_LIMIT
 
 
 def _base_url() -> str:
-    return f"http://127.0.0.1:{settings.AGENT_PORT}"
+    return settings.loopback_base_url
 
 
 def already_handled(event_key: str) -> bool:
@@ -167,7 +167,7 @@ async def _deliver_slack(reply: str, message: InboundMessage) -> None:
 
     async with httpx.AsyncClient(timeout=30) as client:
         result = await client.post(
-            "https://slack.com/api/chat.postMessage",
+            settings.SLACK_POST_MESSAGE_URL,
             headers={"Authorization": f"Bearer {token}"},
             json={
                 "channel": message.metadata.get("channel"),

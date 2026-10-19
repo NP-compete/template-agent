@@ -36,23 +36,23 @@ _DEFAULT_MAX_OUTPUT_TOKENS: int = settings.MAX_OUTPUT_TOKENS
 # connection error to an endpoint nobody had configured, which reads as
 # an infrastructure problem rather than "that model is not in a list".
 # Naming is the one thing these providers are consistent about.
-_VERTEX_PREFIXES = ("gemini-", "claude-")
-_OPENAI_PREFIXES = ("gpt-", "o1-", "o3-", "o4-")
+# The prefix lists live in settings, not here — a new model family
+# should not need a code change to route correctly.
 
 
 def is_vertex_model(model_name: str) -> bool:
     """True for Vertex-hosted Gemini and Claude names."""
-    return model_name.lower().startswith(_VERTEX_PREFIXES)
+    return model_name.lower().startswith(settings.vertex_model_prefixes)
 
 
 def is_claude_model(model_name: str) -> bool:
     """True for Claude on Vertex Model Garden, which has its own client."""
-    return model_name.lower().startswith("claude-")
+    return model_name.lower().startswith(settings.claude_model_prefixes)
 
 
 def is_openai_model(model_name: str) -> bool:
     """Does this model name belong to OpenAI rather than another provider?"""
-    return model_name.lower().startswith(_OPENAI_PREFIXES)
+    return model_name.lower().startswith(settings.openai_model_prefixes)
 
 
 _THRESHOLD_MAP = {v.name: v for v in HarmBlockThreshold}
@@ -69,16 +69,6 @@ safety_settings = {
 }
 
 
-# Gemini 2.5 models that reason before answering. Their thinking tokens
-# come out of max_output_tokens, so an unbounded budget can consume the
-# entire allowance and return an empty message.
-_THINKING_MODELS = ("gemini-2.5-pro", "gemini-3")
-
-# Fraction of the output allowance a model may spend on reasoning.
-_THINKING_SHARE = 0.25
-_MIN_THINKING_BUDGET = 512
-
-
 def _thinking_budget_for(model_name: str, max_output_tokens: int | None) -> int | None:
     """Cap reasoning tokens so there is room left to answer.
 
@@ -89,15 +79,26 @@ def _thinking_budget_for(model_name: str, max_output_tokens: int | None) -> int 
     nothing to say — and 2.5-pro is the model the shipped PROMPT.md
     names, so this was the out-of-the-box experience.
 
-    Flash does not reason by default and is left alone; passing a budget
-    to a model that does not think is at best ignored.
+    Which models reason, and how much of the allowance they may
+    spend, are in settings (``THINKING_MODEL_PREFIXES``,
+    ``THINKING_BUDGET_SHARE``, ``MIN_THINKING_BUDGET``).
+
+    One correction worth recording: this used to say "Flash does not
+    reason by default and is left alone", which was true of Gemini
+    2.5 Flash and false of 3.x — and the prefix list said ``gemini-3``,
+    so Flash was getting a budget while the comment claimed it was
+    not. The behaviour was right; the comment was wrong.
     """
-    if not any(model_name.startswith(prefix) for prefix in _THINKING_MODELS):
+    prefixes = settings.thinking_model_prefixes
+    if not any(model_name.startswith(prefix) for prefix in prefixes):
         return None
     if not max_output_tokens:
         return None
 
-    budget = max(_MIN_THINKING_BUDGET, int(max_output_tokens * _THINKING_SHARE))
+    budget = max(
+        settings.MIN_THINKING_BUDGET,
+        int(max_output_tokens * settings.THINKING_BUDGET_SHARE),
+    )
     # The floor can exceed a small allowance — 512 against
     # max_output_tokens=128 leaves nothing to answer with, which is the
     # same empty-reply failure this function exists to prevent, just
@@ -219,7 +220,7 @@ def _create_vllm_model(
     if not settings.VLLM_BASE_URL:
         raise ValueError(
             f"Model '{model_name}' is not a Vertex AI model name "
-            f"(those start with 'gemini-' or 'claude-'). "
+            f"(those start with {', '.join(settings.vertex_model_prefixes)}). "
             f"Set VLLM_BASE_URL to serve it from an OpenAI-compatible endpoint."
         )
 

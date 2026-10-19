@@ -98,11 +98,11 @@ class TestValidateGrantedScopes:
         assert any("granted no scopes" in r.message for r in caplog.records)
 
     def test_an_entirely_different_grant_is_still_kept(self, caplog):
-        # Dataverse: asked for `session:role-any` (from discovery),
+        # the warehouse server: asked for `session:role-any` (from discovery),
         # granted `read write`. Nothing requested was granted, yet the
         # token is the usable one.
         with caplog.at_level("WARNING"):
             assert validate_granted_scopes(
-                ["read", "write"], ["session:role-any"], "dataverse"
+                ["read", "write"], ["session:role-any"], "warehouse"
             ) == ["read", "write"]
         assert any("withheld" in r.message for r in caplog.records)

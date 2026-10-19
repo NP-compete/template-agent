@@ -24,6 +24,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ValidationError
 
+from deep_agent.src.settings import settings
+
 
 @dataclass
 class Finding:
@@ -97,7 +99,7 @@ def _validate_model(
 # a brand name in a .py is a name somebody has to find in source when
 # they fork, and the needles have to track whatever the shipped config
 # carries anyway.
-_MARKERS_FILE = "runtime/template-markers.yaml"
+_MARKERS_FILE = settings.TEMPLATE_MARKERS_FILE
 
 
 def _example_markers(config_dir: Path) -> list[tuple[str, str, str]]:
