@@ -115,11 +115,30 @@ class ModelCallLimitConfig(BaseModel):
     run_limit: int = 50
 
 
+class ToolExclusionConfig(BaseModel):
+    """Tools removed by product decision, not by model capability.
+
+    Distinct from a harness profile's ``excluded_tools``, which means
+    "this model cannot use it" and is shown on the Models page as a
+    limitation. A tool removed because its job moved into a skill is
+    not a limitation of the model, and listing it there tells the
+    reader something untrue.
+    """
+
+    enabled: bool = True
+    tools: list[str] = Field(default_factory=list)
+
+
 class ToolCallLimitConfig(BaseModel):
     """Config for ToolCallLimitMiddleware — cap tool calls per run."""
 
     enabled: bool = True
     run_limit: int = 200
+    # Per-tool ceilings, for the tool that loops rather than the run
+    # that sprawls. A global limit of 200 never fires; a single tool
+    # called six times in one answer is the thing that actually
+    # costs the user ninety seconds.
+    per_tool: dict[str, int] = Field(default_factory=dict)
 
 
 class ModelRetryConfig(BaseModel):
@@ -186,6 +205,7 @@ class MiddlewareDefaults(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     model_call_limit: ModelCallLimitConfig = Field(default_factory=ModelCallLimitConfig)
     tool_call_limit: ToolCallLimitConfig = Field(default_factory=ToolCallLimitConfig)
+    tool_exclusion: ToolExclusionConfig = Field(default_factory=ToolExclusionConfig)
     model_retry: ModelRetryConfig = Field(default_factory=ModelRetryConfig)
     model_fallback: ModelFallbackConfig = Field(default_factory=ModelFallbackConfig)
     tool_retry: ToolRetryConfig = Field(default_factory=ToolRetryConfig)
@@ -219,6 +239,7 @@ class ResolvedMiddlewareConfig(BaseModel):
     skills_enabled: bool = True
     model_call_limit: ModelCallLimitConfig = Field(default_factory=ModelCallLimitConfig)
     tool_call_limit: ToolCallLimitConfig = Field(default_factory=ToolCallLimitConfig)
+    tool_exclusion: ToolExclusionConfig = Field(default_factory=ToolExclusionConfig)
     model_retry: ModelRetryConfig = Field(default_factory=ModelRetryConfig)
     model_fallback: ModelFallbackConfig = Field(default_factory=ModelFallbackConfig)
     tool_retry: ToolRetryConfig = Field(default_factory=ToolRetryConfig)
@@ -313,6 +334,7 @@ def resolve_middleware(
         skills_enabled=skills_enabled,
         model_call_limit=defaults.model_call_limit,
         tool_call_limit=defaults.tool_call_limit,
+        tool_exclusion=defaults.tool_exclusion,
         model_retry=defaults.model_retry,
         model_fallback=defaults.model_fallback,
         tool_retry=defaults.tool_retry,

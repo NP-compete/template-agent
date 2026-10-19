@@ -232,7 +232,7 @@ class TestAgentFactory:
             "skill_paths": [],
             # 'tools:' key absent (not an explicit empty list) triggers
             # the implicit-all-mcp grant.
-            "mcps": ["dataverse-mcp-prod1"],
+            "mcps": ["warehouse-mcp-prod1"],
         }
         mock_config.resolve_tools.return_value = []
         mock_config.resolve_agent_middleware.return_value = MagicMock(
@@ -243,6 +243,13 @@ class TestAgentFactory:
         mock_tool.name = "identify_dataproducts"
         mock_tool.description = "Identifies data products"
         mock_tool.args_schema = None
+        # Server attribution, as `prepare_tools_for_model` stamps it.
+        # The orchestrator now binds only the servers it declares —
+        # the connection pool is wider, because subagents filter down
+        # from it rather than connecting themselves — so a tool with
+        # no `mcp_server` is not attributable to a declared server and
+        # is correctly excluded.
+        mock_tool.metadata = {"mcp_server": "warehouse-mcp-prod1"}
 
         mock_runtime = MagicMock()
         mock_runtime.user = None
@@ -311,7 +318,7 @@ class TestAgentFactory:
         assert [t.name for t in built_tools] == [mock_tool.name]
         assert all(isinstance(t, CapabilityToolProxy) for t in built_tools)
         mock_get_mcp.assert_awaited_once_with(
-            sso_token=None, server_names=["dataverse-mcp-prod1"], user_id=None
+            sso_token=None, server_names=["warehouse-mcp-prod1"], user_id=None
         )
 
     @pytest.mark.asyncio
@@ -326,7 +333,7 @@ class TestAgentFactory:
             "body": "test prompt",
             "skill_paths": [],
             "tools": ["identify_dataproducts"],
-            "mcps": ["dataverse-mcp-prod1"],
+            "mcps": ["warehouse-mcp-prod1"],
         }
         mock_config.resolve_agent_middleware.return_value = MagicMock(
             skills_enabled=True
@@ -425,7 +432,7 @@ class TestAgentFactory:
             "body": "test prompt",
             "skill_paths": [],
             "tools": ["identify_dataproducts"],
-            "mcps": ["dataverse-mcp-prod1"],
+            "mcps": ["warehouse-mcp-prod1"],
         }
         mock_config.resolve_agent_middleware.return_value = MagicMock(
             skills_enabled=True
@@ -513,7 +520,7 @@ class TestAgentFactory:
             "model": "gemini-2.5-flash",
             "body": "test prompt",
             "skill_paths": [],
-            "mcps": ["dataverse-mcp-prod1"],
+            "mcps": ["warehouse-mcp-prod1"],
         }
         mock_config.resolve_tools.return_value = []
         mock_config.resolve_agent_middleware.return_value = MagicMock(

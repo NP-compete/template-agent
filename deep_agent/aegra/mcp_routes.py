@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from deep_agent.src.agent.config import agent_config
+from deep_agent.src.settings import settings
 
 router = APIRouter(tags=["mcp"])
 
@@ -150,7 +151,7 @@ _ICON_CACHE: dict[str, tuple[bytes, str]] = {}
 
 # Enough for any favicon. A URL that returns something larger is not
 # serving an icon.
-_MAX_ICON_BYTES = 256 * 1024
+_MAX_ICON_BYTES = settings.MCP_MAX_ICON_BYTES
 
 
 @router.get("/mcp/{mcp_name}/icon")

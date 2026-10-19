@@ -20,13 +20,14 @@ from urllib.parse import urlparse
 
 import httpx
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-MAX_BYTES = 5 * 1024 * 1024
-TIMEOUT_SECONDS = 20
-MAX_REDIRECTS = 3
+MAX_BYTES = settings.KNOWLEDGE_FETCH_MAX_BYTES
+TIMEOUT_SECONDS = settings.KNOWLEDGE_FETCH_TIMEOUT_SECONDS
+MAX_REDIRECTS = settings.KNOWLEDGE_FETCH_MAX_REDIRECTS
 
 
 class UnsafeURLError(ValueError):

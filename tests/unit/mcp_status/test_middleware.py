@@ -157,3 +157,122 @@ class TestBuildMcpStatusMiddleware:
         handler = MagicMock(return_value="answered")
         assert middleware.wrap_model_call(request, handler) == "answered"
         request.override.assert_not_called()
+
+
+class TestOfferConnect:
+    """A declined turn must still offer the one click that fixes it.
+
+    The Connect button was only ever built from a tool *failure*.
+    Told up front that the warehouse server was not connected, the model
+    correctly declined without calling anything, so nothing was
+    recorded and the reply sent the reader to a settings page.
+    """
+
+    @staticmethod
+    def _response(text: str, extra: dict | None = None):
+        message = MagicMock()
+        message.text = text
+        message.additional_kwargs = extra if extra is not None else {}
+        response = MagicMock()
+        response.result = [message]
+        return response, message
+
+    @staticmethod
+    def _offer(response, unconnected):
+        # Built by a factory, so reach the method through an instance.
+        instance = mw.build_mcp_status_middleware(user_id="u1")
+        return instance._offer_connect(response, unconnected)
+
+    def test_stamps_the_server_the_answer_names(self):
+        response, message = self._response(
+            "I cannot look up your manager because the warehouse server is not connected."
+        )
+        self._offer(response, ("warehouse", "miro"))
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "warehouse", "reason": "not_connected"}
+        ]
+
+    def test_stamps_nothing_when_the_answer_names_nothing(self):
+        response, message = self._response("Your manager is Jane Roe.")
+        self._offer(response, ("warehouse", "miro"))
+
+        assert "auth_required" not in message.additional_kwargs
+
+    def test_narrows_a_discovery_stamp_to_the_relevant_server(self):
+        # Discovery records every unconnected server; five buttons
+        # under an answer about one of them is the problem again.
+        existing = {
+            "auth_required": [
+                {"mcp_name": "atlan", "reason": "not_connected"},
+                {"mcp_name": "warehouse", "reason": "expired"},
+                {"mcp_name": "miro", "reason": "not_connected"},
+            ]
+        }
+        response, message = self._response(
+            "the warehouse server is not connected, so I could not look that up.",
+            existing,
+        )
+        self._offer(response, ("atlan", "warehouse", "miro"))
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "warehouse", "reason": "expired"}
+        ]
+
+    def test_keeps_the_full_list_when_the_answer_attributes_nothing(self):
+        existing = {"auth_required": [{"mcp_name": "atlan", "reason": "not_connected"}]}
+        response, message = self._response("Something went wrong.", existing)
+        self._offer(response, ("atlan",))
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "atlan", "reason": "not_connected"}
+        ]
+
+    def test_a_tool_failure_reason_wins_over_the_derived_one(self):
+        existing = {"auth_required": [{"mcp_name": "warehouse", "reason": "expired"}]}
+        response, message = self._response(
+            "the warehouse server needs reconnecting.", existing
+        )
+        self._offer(response, ("warehouse",))
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "warehouse", "reason": "expired"}
+        ]
+
+
+class TestConnectionStateCarriesTheAccount:
+    """The notice must name who each integration acts as."""
+
+    @staticmethod
+    def _entries(entries):
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        return patch(
+            "deep_agent.aegra.mcp_oauth_handlers.handle_mcp_connections",
+            _AsyncMock(return_value={"connections": entries}),
+        )
+
+    async def test_annotates_a_connected_integration_with_its_account(self):
+        with self._entries(
+            [{"mcp_name": "warehouse", "connected": True, "account": "alice@corp"}]
+        ):
+            connected, unconnected = await mw.connection_state("u1")
+
+        assert connected == ["warehouse (as alice@corp)"]
+        assert unconnected == []
+
+    async def test_falls_back_to_the_bare_name_without_an_account(self):
+        with self._entries(
+            [{"mcp_name": "gitlab", "connected": True, "account": None}]
+        ):
+            connected, _ = await mw.connection_state("u1")
+
+        assert connected == ["gitlab"]
+
+    async def test_unconnected_names_stay_bare_so_matching_still_works(self):
+        # narrow_auth_requests matches these against the reply text.
+        with self._entries([{"mcp_name": "miro", "connected": False, "account": None}]):
+            connected, unconnected = await mw.connection_state("u1")
+
+        assert connected == []
+        assert unconnected == ["miro"]

@@ -20,8 +20,8 @@ from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-_HEALTH_CACHE_TTL: float = 30.0
-_HEALTH_CHECK_TIMEOUT: float = 5.0
+_HEALTH_CACHE_TTL = settings.MCP_HEALTH_CACHE_TTL_SECONDS
+_HEALTH_CHECK_TIMEOUT = settings.MCP_HEALTH_CHECK_TIMEOUT_SECONDS
 
 _cached_mcp_health: dict[str, Any] | None = None
 _cached_mcp_health_ts: float = 0.0

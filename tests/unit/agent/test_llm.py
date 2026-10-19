@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from deep_agent.src.settings import settings
+
 import pytest
 
 from deep_agent.src.agent.llm import (
@@ -72,14 +74,16 @@ class TestCreateModel:
     def test_unknown_model_raises_error_with_supported_list(self):
         """Test that unknown model raises error listing supported models."""
         mock_creds = MagicMock()
-        mock_settings = MagicMock()
-        mock_settings.VLLM_BASE_URL = ""
 
+        # Override the one field under test rather than replacing the
+        # whole settings object: routing now reads its prefix lists
+        # from settings too, and a MagicMock stands in for those as a
+        # MagicMock, which `startswith` rejects.
         with (
             patch(
                 "deep_agent.src.agent.llm.get_service_account_credentials"
             ) as mock_get_creds,
-            patch("deep_agent.src.agent.llm.settings", mock_settings),
+            patch.object(settings, "VLLM_BASE_URL", ""),
         ):
             mock_get_creds.return_value = (mock_creds, "test-project")
 
@@ -144,8 +148,6 @@ class TestCreateModel:
 
     def test_an_unknown_name_still_needs_a_vllm_endpoint(self):
         """Prefix routing must not swallow genuinely unknown models."""
-        mock_settings = MagicMock()
-        mock_settings.VLLM_BASE_URL = ""
-        with patch("deep_agent.src.agent.llm.settings", mock_settings):
-            with pytest.raises(ValueError, match="gemini-' or 'claude-'"):
+        with patch.object(settings, "VLLM_BASE_URL", ""):
+            with pytest.raises(ValueError, match="gemini-, claude-"):
                 create_model("llama-3.1-70b")

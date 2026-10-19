@@ -59,6 +59,20 @@ def describe_message(msg: Any) -> dict[str, Any]:
 
     out: dict[str, Any] = {}
 
+    # Integrations this turn could not reach, stamped onto the
+    # message by McpAuthNoticeMiddleware. This is what the inline
+    # Connect button reads.
+    #
+    # Read off the message rather than a contextvar: the run executes
+    # in a worker task and the reply is serialised somewhere else, so
+    # a contextvar set during the run is gone by the time anyone
+    # reads it. The message is the one thing that crosses that
+    # boundary — which is why routed_tier and pii_scrubbed travel the
+    # same way.
+    auth_required = extra.get("auth_required")
+    if isinstance(auth_required, list) and auth_required:
+        out["auth_required"] = auth_required
+
     model = _first(meta, _MODEL_KEYS)
     if model:
         out["model"] = model

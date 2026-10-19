@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -132,8 +133,38 @@ def build_self_description(
             )
 
     can: list[str] = _capabilities(agent_config)
+
+    # Tell it which model it is.
+    #
+    # The name was read here only to look up excluded tools, and
+    # mentioned in the prompt only when there were any — so most of
+    # the time the model was never told what it was running on.
+    # Asked directly it answered from training data and said
+    # "Gemini 3.7 Flash" while every call in the trace went to
+    # gemini-3.8-flash. A model does not reliably know its own
+    # version; the deployment does, and this is the file whose job
+    # is telling it who it is.
+    if model_name:
+        can.insert(0, f"- You are running on the model `{model_name}`.")
+
     if connected:
         can.append(f"- Integrations you can use now: {', '.join(sorted(connected))}.")
+        if any("(as " in entry for entry in connected):
+            # The identity that matters per integration.
+            #
+            # The agent's own login is the account the user signed in
+            # with here; an integration acts as whichever account was
+            # connected to it, and the two are routinely different
+            # people's identifiers for the same human. "Who is my
+            # manager" resolved against the agent login answers for
+            # the wrong directory entry without ever looking wrong.
+            can.append(
+                "- When you answer from an integration, 'the user' is the "
+                "account shown in brackets for that integration, not the "
+                "identity you were given for this session. Resolve 'me', "
+                "'my' and 'mine' against that account, and say which "
+                "account an answer is about when more than one could apply."
+            )
 
     lines: list[str] = []
 
@@ -141,11 +172,23 @@ def build_self_description(
         # Ahead of the policy limits: an unconnected server is the
         # one the model is most likely to reach for and the only one
         # the user can fix themselves.
+        #
+        # This used to say "tell the user to connect it rather than
+        # calling it". That was right when calling one only produced
+        # an error. Calling one now pauses the run and puts a Connect
+        # button in front of the user, so the old wording stopped the
+        # model one step short of the thing that actually gets the
+        # integration connected — it answered "please connect Atlan"
+        # without ever touching the tool, and the pause never
+        # happened.
         lines.append(
-            "- Not connected, so their tools will fail: "
-            f"{', '.join(sorted(unconnected))}. If one is needed, tell the user "
-            "to connect it in Settings → Components → MCP rather than calling "
-            "it and reporting the error."
+            "- Not connected yet: "
+            f"{', '.join(sorted(unconnected))}. Do not refuse these and do "
+            "not ask the user to go and connect them. If one is needed, call "
+            "its tool as you normally would: that pauses the run, offers the "
+            "user a Connect button, and resumes where it left off once they "
+            f"connect. Only point at {settings.MCP_SETTINGS_PATH} if calling "
+            "the tool tells you the user has already declined."
         )
 
     if dry_run:

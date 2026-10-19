@@ -66,6 +66,9 @@ async def analytics_summary(
         "p95_seconds": result.p95_seconds,
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
+        "cached_tokens": result.cached_tokens,
+        # None, not 0 — see Summary.cache_hit_rate.
+        "cache_hit_rate": result.cache_hit_rate,
         "feedback_up": result.feedback_up,
         "feedback_down": result.feedback_down,
         "satisfaction": result.satisfaction,

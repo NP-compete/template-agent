@@ -22,14 +22,14 @@ import asyncio
 import contextlib
 from typing import Any
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # Seconds between refreshes. Faster than KEDA's polling interval, so the
 # scaler never reads a value staler than its own decision window.
-REFRESH_INTERVAL_SECONDS = 10
-
+REFRESH_INTERVAL_SECONDS = settings.INFLIGHT_METRIC_INTERVAL_SECONDS
 # Statuses that mean "work is happening or about to". `pending` counts:
 # a queued run with no pod to claim it is exactly the case where
 # scaling to zero would strand work.

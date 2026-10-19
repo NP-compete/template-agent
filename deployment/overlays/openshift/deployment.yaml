@@ -80,6 +80,14 @@ spec:
             - containerPort: 5002
               name: http
               protocol: TCP
+          # Pool bounds and timeouts only. agent-config stays listed
+          # key by key below — an unlisted key there must not reach the
+          # pod — but wiring a dozen related capacity knobs that way is
+          # a hundred lines in which one forgotten entry silently
+          # restores a library default. See docs/scalability.md.
+          envFrom:
+            - configMapRef:
+                name: agent-tuning
           env:
             - name: AGENT_HOST
               valueFrom:

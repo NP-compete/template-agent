@@ -111,3 +111,110 @@ class TestConnectionState:
         built = _build()
         request = _request()
         assert built.wrap_model_call(request, MagicMock(return_value="ok")) == "ok"
+
+
+class TestOfferConnect:
+    """A turn that declines must still offer the Connect button.
+
+    This middleware is the one actually wired into the graph, and it
+    tells the model up front which servers are unreachable — so the
+    model declines without calling anything, nothing raises, and the
+    failure-driven button never appeared.
+    """
+
+    @staticmethod
+    def _response(text: str, extra: dict | None = None):
+        message = MagicMock()
+        message.text = text
+        message.additional_kwargs = extra if extra is not None else {}
+        response = MagicMock()
+        response.result = [message]
+        return response, message
+
+    def test_stamps_the_server_the_answer_names(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        response, message = self._response("the warehouse server is not connected.")
+        _offer_connect(response, ("warehouse", "miro"), "use warehouse for this")
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "warehouse", "reason": "not_connected"}
+        ]
+
+    def test_stamps_nothing_on_a_normal_answer(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        response, message = self._response("Your manager is Jane Roe.")
+        _offer_connect(response, ("warehouse",))
+
+        assert "auth_required" not in message.additional_kwargs
+
+    def test_narrows_a_discovery_stamp_to_the_named_server(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        existing = {
+            "auth_required": [
+                {"mcp_name": "atlan", "reason": "not_connected"},
+                {"mcp_name": "warehouse", "reason": "expired"},
+            ]
+        }
+        response, message = self._response(
+            "the warehouse server needs reconnecting.", existing
+        )
+        _offer_connect(response, ("atlan", "warehouse"), "use warehouse please")
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "warehouse", "reason": "expired"}
+        ]
+
+    def test_nothing_unconnected_is_a_no_op(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        response, message = self._response("the warehouse server is fine.")
+        _offer_connect(response, (), "use warehouse")
+
+        assert "auth_required" not in message.additional_kwargs
+
+
+class TestOfferConnectNeedsAnAsk:
+    """A Connect button answers "I could not do what you asked".
+
+    Matching only the answer turned "which integrations can you use
+    right now?" into four Connect buttons: the reply listed them, so
+    every one looked like a blocked request.
+    """
+
+    @staticmethod
+    def _response(text: str):
+        message = MagicMock()
+        message.text = text
+        message.additional_kwargs = {}
+        response = MagicMock()
+        response.result = [message]
+        return response, message
+
+    def test_no_button_when_the_question_only_asked_about_integrations(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        response, message = self._response(
+            "Connected: gworkspace. Not connected: atlassian, datadog, gitlab, miro."
+        )
+        _offer_connect(
+            response,
+            ("atlassian", "datadog", "gitlab", "miro"),
+            "which integrations can you use right now?",
+        )
+
+        assert "auth_required" not in message.additional_kwargs
+
+    def test_button_when_the_question_asked_to_use_one(self):
+        from deep_agent.src.self_knowledge.middleware import _offer_connect
+
+        response, message = self._response("Miro is not connected.")
+        _offer_connect(
+            response, ("miro", "datadog"), "use the miro mcp to list my boards"
+        )
+
+        assert message.additional_kwargs["auth_required"] == [
+            {"mcp_name": "miro", "reason": "not_connected"}
+        ]

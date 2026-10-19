@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from deep_agent.aegra.admin_routes import router as admin_router
+from deep_agent.aegra.admission import AdmissionControlMiddleware
 from deep_agent.aegra.analytics_routes import router as analytics_router
 from deep_agent.aegra.attachment_routes import router as attachment_router
 from deep_agent.aegra.channel_routes import router as channel_router
@@ -228,6 +229,9 @@ app.add_middleware(RequestContextMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     RequestSizeLimitMiddleware, max_size_bytes=settings.REQUEST_BODY_MAX_SIZE
+)
+app.add_middleware(
+    AdmissionControlMiddleware, max_concurrent=settings.MAX_CONCURRENT_RUNS
 )
 app.include_router(thread_cleanup_router)
 app.include_router(skill_router)

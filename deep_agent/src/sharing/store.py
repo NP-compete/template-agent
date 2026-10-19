@@ -45,15 +45,15 @@ logger = get_python_logger()
 
 # 32 hex characters. Long enough that guessing is not a strategy, which
 # matters most for `public` shares, where the token is the only control.
-_TOKEN_BYTES = 16
+_TOKEN_BYTES = settings.SHARE_TOKEN_BYTES
 
-DEFAULT_EXPIRY_DAYS = 30
-MAX_EXPIRY_DAYS = 365
+DEFAULT_EXPIRY_DAYS = settings.SHARE_DEFAULT_EXPIRY_DAYS
+MAX_EXPIRY_DAYS = settings.SHARE_MAX_EXPIRY_DAYS
 
 # Beyond this a snapshot stops being a conversation anyone will read
 # and starts being a payload.
-MAX_SNAPSHOT_MESSAGES = 500
-MAX_MESSAGE_CHARS = 20_000
+MAX_SNAPSHOT_MESSAGES = settings.SHARE_MAX_SNAPSHOT_MESSAGES
+MAX_MESSAGE_CHARS = settings.SHARE_MAX_MESSAGE_CHARS
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_share (

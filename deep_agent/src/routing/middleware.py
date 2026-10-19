@@ -14,13 +14,14 @@ from typing import Any
 
 from deep_agent.src.routing.classifier import choose_tier
 from deep_agent.src.routing.config import RouterConfig, load_router_config
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # Key under which the chosen tier is remembered on thread state, so
 # "first_message" routing survives subsequent turns.
-STATE_KEY = "_routed_tier"
+STATE_KEY = settings.ROUTING_STATE_KEY
 
 
 def _first_human_text(messages: list[Any]) -> str:

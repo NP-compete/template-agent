@@ -42,6 +42,10 @@ Global middleware defaults from agent.yaml.
 | `tool_call_limit` | ToolCallLimitConfig | _(section)_ |  |
 | `tool_call_limit.enabled` | bool | `True` |  |
 | `tool_call_limit.run_limit` | int | `200` |  |
+| `tool_call_limit.per_tool` | map[int] | _(empty)_ |  |
+| `tool_exclusion` | ToolExclusionConfig | _(section)_ |  |
+| `tool_exclusion.enabled` | bool | `True` |  |
+| `tool_exclusion.tools` | list[str] | _(empty)_ |  |
 | `model_retry` | ModelRetryConfig | _(section)_ |  |
 | `model_retry.enabled` | bool | `True` |  |
 | `model_retry.max_retries` | int | `3` |  |

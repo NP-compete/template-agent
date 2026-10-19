@@ -134,3 +134,27 @@ class TestShape:
         assert "## What you can do" in out
         assert "## What you cannot do" in out
         assert out.index("can do") < out.index("cannot do")
+
+
+class TestModelIdentity:
+    """A model does not reliably know its own version.
+
+    Asked "which model do you use?" the agent answered "Gemini 3.7
+    Flash" from training data, while every generation in the trace
+    recorded gemini-3.8-flash. The deployment knows; this is the
+    file whose job is telling it.
+    """
+
+    def test_states_the_model_it_is_running_on(self):
+        from deep_agent.src.self_knowledge.describe import build_self_description
+
+        out = build_self_description(model_name="gemini-3.8-flash")
+
+        assert "gemini-3.8-flash" in out
+
+    def test_says_nothing_when_the_model_is_unknown(self):
+        from deep_agent.src.self_knowledge.describe import build_self_description
+
+        out = build_self_description(model_name="")
+
+        assert "running on the model" not in out

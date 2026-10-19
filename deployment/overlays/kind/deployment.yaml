@@ -55,6 +55,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: agent-config
+            - configMapRef:
+                name: agent-tuning
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: "/var/run/secrets/google/application_default_credentials.json"

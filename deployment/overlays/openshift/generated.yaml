@@ -9,11 +9,12 @@ spec:
   replicas: 2
   template:
     spec:
+      terminationGracePeriodSeconds: 600
       containers:
       - name: agent
         resources:
           requests:
-            memory: 512Mi
+            memory: 1536Mi
             cpu: 250m
           limits:
             memory: 2Gi
@@ -22,9 +23,9 @@ spec:
           httpGet:
             path: /health
           initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
+          periodSeconds: 20
+          timeoutSeconds: 10
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /health
@@ -38,6 +39,12 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
           failureThreshold: 12
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sleep
+              - '15'
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -53,15 +60,21 @@ spec:
       target:
         type: Utilization
         averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
+  - type: Pods
+    pods:
+      metric:
+        name: aegra_runs_in_flight
       target:
-        type: Utilization
-        averageUtilization: 75
+        type: AverageValue
+        averageValue: '25'
   behavior:
     scaleDown:
-      stabilizationWindowSeconds: 300
+      stabilizationWindowSeconds: 900
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+      selectPolicy: Min
 ---
 apiVersion: build.openshift.io/v1
 kind: BuildConfig

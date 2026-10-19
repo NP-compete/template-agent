@@ -39,22 +39,23 @@ from fastapi import File as FileParam
 from pydantic import BaseModel
 
 from deep_agent.aegra.auth_helpers import authenticated_user_id
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+router = APIRouter(prefix=settings.DOCUMENTS_ROUTE_PREFIX, tags=["documents"])
 
 # Matches the PVC in deployment/components/documents-pvc. Kept as a
 # setting rather than read from the filesystem: `statvfs` reports the
 # *volume's* size, which in Kind is the node disk, so it would happily
 # accept 40 GB into a claim requesting 500Mi and fail at some later
 # unrelated write.
-_DEFAULT_CAPACITY_BYTES = 500 * 1024 * 1024
+_DEFAULT_CAPACITY_BYTES = settings.DOCUMENTS_CAPACITY_BYTES
 
 # Warn well before refusing. A limit that is only mentioned at the
 # moment it blocks you is a surprise, not a budget.
-_WARN_AT = 0.80
+_WARN_AT = settings.DOCUMENTS_CAPACITY_WARN_FRACTION
 
 _READABLE_SUFFIXES = {
     ".csv",
@@ -236,7 +237,7 @@ class DocumentBody(BaseModel):
 # Big enough for a data dictionary or a config, small enough that a
 # browser can render it. Anything larger is a file to download, not
 # to edit in a text box.
-_MAX_EDITABLE_BYTES = 1024 * 1024
+_MAX_EDITABLE_BYTES = settings.DOCUMENTS_MAX_EDITABLE_BYTES
 
 
 @router.get("/{name:path}")

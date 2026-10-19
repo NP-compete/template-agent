@@ -25,9 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import psycopg
-from psycopg.rows import dict_row
-
 from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
@@ -35,7 +32,7 @@ logger = get_python_logger()
 
 # A window wider than this turns a dashboard refresh into a sequential
 # scan of the whole runs table.
-MAX_WINDOW_DAYS = 365
+MAX_WINDOW_DAYS = settings.ANALYTICS_MAX_WINDOW_DAYS
 
 # Statuses that mean the run is over and its duration is a duration.
 #
@@ -68,7 +65,7 @@ _RECOVERABLE = ["interrupted"]
 # An hour matches `max_execute_timeout` in agent.yaml — the longest
 # a single operation is permitted to take, so nothing legitimate is
 # still running past it.
-_STALE_AFTER_SECONDS = 3600
+_STALE_AFTER_SECONDS = settings.ANALYTICS_STALE_RUN_SECONDS
 
 
 # Runs this agent performed for a person, as opposed to for a test.
@@ -123,7 +120,12 @@ tokens AS (
         COALESCE(
             (r.execution_params #>> '{usage,output_tokens}')::bigint,
             d.output_tokens, 0
-        ) AS output_tokens
+        ) AS output_tokens,
+        -- Only the recorded path reports this. The derived fallback
+        -- reads message usage_metadata, which has no cache field, so
+        -- older runs report 0 rather than a wrong number.
+        COALESCE((r.execution_params #>> '{usage,cached_tokens}')::bigint, 0)
+            AS cached_tokens
     FROM runs r
     LEFT JOIN derived d ON d.run_id = r.run_id
     WHERE r.created_at >= now() - make_interval(days => %(days)s)
@@ -176,6 +178,10 @@ class Summary:
     p95_seconds: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Subset of input_tokens that came from a cached prompt prefix,
+    # billed at a discount. The share of input that is cached is the
+    # only direct read on whether prompt caching works.
+    cached_tokens: int = 0
     feedback_up: int = 0
     feedback_down: int = 0
 
@@ -191,16 +197,37 @@ class Summary:
         return round(self.successes / finished * 100, 1) if finished else None
 
     @property
+    def cache_hit_rate(self) -> float | None:
+        """Share of input tokens served from the cached prefix.
+
+        None when nothing was recorded, which is not the same as 0%:
+        a provider that reports no cache field and a genuine run of
+        cache misses are indistinguishable here, and showing 0% for
+        the first would be a confident wrong answer.
+        """
+        if not self.input_tokens:
+            return None
+        return round(self.cached_tokens / self.input_tokens * 100, 1)
+
+    @property
     def satisfaction(self) -> float | None:
         """Thumbs-up share of rated runs, or None when nothing was rated."""
         rated = self.feedback_up + self.feedback_down
         return round(self.feedback_up / rated * 100, 1) if rated else None
 
 
-async def _connect() -> psycopg.AsyncConnection:
-    return await psycopg.AsyncConnection.connect(
-        settings.database_uri, row_factory=dict_row
-    )
+def _connect() -> Any:
+    """Borrow a connection from the shared pool.
+
+    This opened a raw connection per query — five handlers, each
+    paying a TCP, TLS and authentication handshake to render a
+    dashboard, and each holding a backend that no pool had counted.
+    The pool already yields ``dict_row``, which is what these queries
+    read.
+    """
+    from deep_agent.src.db.pool import connection
+
+    return connection()
 
 
 async def summary(window: Window) -> Summary:
@@ -245,7 +272,8 @@ async def summary(window: Window) -> Summary:
         COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (
             ORDER BY seconds) FILTER (WHERE status = ANY(%(terminal)s)), 0) AS p95,
         COALESCE((SELECT SUM(input_tokens) FROM tokens), 0)  AS input_tokens,
-        COALESCE((SELECT SUM(output_tokens) FROM tokens), 0) AS output_tokens
+        COALESCE((SELECT SUM(output_tokens) FROM tokens), 0) AS output_tokens,
+        COALESCE((SELECT SUM(cached_tokens) FROM tokens), 0) AS cached_tokens
     FROM scoped
     """
     params = {
@@ -255,7 +283,7 @@ async def summary(window: Window) -> Summary:
         "stale_after": _STALE_AFTER_SECONDS,
     }
 
-    async with await _connect() as conn:
+    async with _connect() as conn:
         row = await (await conn.execute(sql, params)).fetchone() or {}
         feedback = (
             await (
@@ -288,6 +316,7 @@ async def summary(window: Window) -> Summary:
         p95_seconds=round(float(row.get("p95") or 0), 2),
         input_tokens=int(row.get("input_tokens") or 0),
         output_tokens=int(row.get("output_tokens") or 0),
+        cached_tokens=int(row.get("cached_tokens") or 0),
         feedback_up=int(feedback.get("up") or 0),
         feedback_down=int(feedback.get("down") or 0),
     )
@@ -338,7 +367,7 @@ async def timeseries(window: Window, bucket: str = "day") -> list[dict[str, Any]
     GROUP BY b.bucket
     ORDER BY b.bucket
     """
-    async with await _connect() as conn:
+    async with _connect() as conn:
         rows = await (
             await conn.execute(
                 sql,
@@ -442,7 +471,7 @@ async def by_model(window: Window) -> list[dict[str, Any]]:
     GROUP BY 1
     ORDER BY runs DESC
     """
-    async with await _connect() as conn:
+    async with _connect() as conn:
         rows = await (
             await conn.execute(sql, {"days": window.days, "terminal": _TERMINAL})
         ).fetchall()
@@ -535,7 +564,7 @@ def classify_error(message: str | None) -> str:
 
 async def errors(window: Window) -> list[dict[str, Any]]:
     """Failure counts by class, most frequent first."""
-    async with await _connect() as conn:
+    async with _connect() as conn:
         rows = await (
             await conn.execute(
                 f"""
@@ -627,7 +656,7 @@ async def by_user(window: Window, *, enabled: bool, limit: int = 50) -> UserBrea
     ORDER BY runs DESC
     LIMIT %(limit)s
     """
-    async with await _connect() as conn:
+    async with _connect() as conn:
         rows = await (
             await conn.execute(sql, {"days": window.days, "limit": limit})
         ).fetchall()

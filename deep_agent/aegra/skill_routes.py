@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from deep_agent.src.agent.config.parser import parse_frontmatter
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
@@ -88,7 +89,7 @@ _READABLE_SUFFIXES = {".md", ".json", ".yaml", ".yml", ".txt", ".py", ".sh"}
 
 # One skill's reference file is prose, not a dataset. A cap keeps a
 # stray large file from becoming a multi-megabyte JSON response.
-_MAX_FILE_BYTES = 256_000
+_MAX_FILE_BYTES = settings.SKILL_MAX_FILE_BYTES
 
 
 @router.get("/skills/{name}")

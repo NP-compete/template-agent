@@ -21,6 +21,7 @@ import json
 import math
 import os
 import time
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -47,17 +48,80 @@ _mcp_breakers: dict[str, CircuitBreaker] = {}
 
 # Used when a caller does not name a server; keeps the old behaviour
 # rather than silently sharing one server's breaker with another.
-_SHARED_BREAKER_KEY = "mcp-servers"
+_SHARED_BREAKER_KEY = settings.MCP_SHARED_BREAKER_KEY
 
 _MCP_TOOL_CACHE_TTL: float = float(agent_config.get_cache_config().mcp.ttl)
 
 # Cache keys with a background refresh already in flight, so a burst
 # of requests triggers one rebuild rather than one each.
 _refreshing: set[str] = set()
-_MCP_AUTH_SET_TTL: int = 604800  # 7 days
-_cached_tools: dict[str | None, list[Any]] = {}
+_MCP_AUTH_SET_TTL = settings.MCP_AUTH_SET_TTL_SECONDS
+
+# The tool cache is keyed per user, and each entry is large: measured
+# at 615,705 characters of tool description and schema for 319 tools,
+# before object overhead for the tool instances themselves.
+#
+# It used to be an unbounded dict. The TTL is only consulted when an
+# entry is *read*, so a user who stopped using the agent was never
+# read again and never freed — growth tracked unique users since pod
+# start, against a 2Gi limit already carrying ~1.2Gi of resident
+# interpreter. That is an OOM at a user count nobody would trace back
+# to a cache.
+#
+# Bounded and evicted least-recently-used instead. An evicted user
+# pays a rediscovery, which is the right trade: slow is recoverable,
+# OOMKilled is not.
+_MCP_TOOL_CACHE_MAX_USERS: int = int(os.environ.get("MCP_TOOL_CACHE_MAX_USERS", "200"))
+_cached_tools: OrderedDict[str | None, list[Any]] = OrderedDict()
 _cached_tools_ts: dict[str | None, float] = {}
 _cached_connected_set: dict[str | None, set[str]] = {}
+
+
+def _forget_cached_tools(key: str | None) -> None:
+    """Drop one cache entry from every structure that tracks it."""
+    _cached_tools.pop(key, None)
+    _cached_tools_ts.pop(key, None)
+    _cached_connected_set.pop(key, None)
+    if isinstance(key, str):
+        _refreshing.discard(key)
+
+
+def _touch_cached_tools(key: str | None) -> None:
+    """Mark an entry as recently used.
+
+    Without this the OrderedDict stays in insertion order and
+    "least recently used" evicts the oldest *written* entry — which
+    for a long-lived user whose list refreshes rarely is exactly the
+    one worth keeping.
+    """
+    if key in _cached_tools:
+        _cached_tools.move_to_end(key)
+
+
+def _store_cached_tools(key: str | None, tools: list[Any], connected: set[str]) -> None:
+    """Record one user's tool list, evicting the least recently used.
+
+    The three dicts are parallel and have to stay that way; an entry
+    present in one and missing from another is how a stale auth set
+    silently survives an eviction.
+    """
+    _cached_tools[key] = tools
+    _cached_tools.move_to_end(key)
+    _cached_tools_ts[key] = time.time()
+    _cached_connected_set[key] = connected
+
+    while len(_cached_tools) > _MCP_TOOL_CACHE_MAX_USERS:
+        oldest, _ = _cached_tools.popitem(last=False)
+        _cached_tools_ts.pop(oldest, None)
+        _cached_connected_set.pop(oldest, None)
+        if isinstance(oldest, str):
+            _refreshing.discard(oldest)
+        logger.info(
+            "MCP tool cache full (%d users) — evicted %s",
+            _MCP_TOOL_CACHE_MAX_USERS,
+            oldest,
+        )
+
 
 _current_access_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_access_token", default=None
@@ -256,7 +320,7 @@ def _token_remaining(token: str) -> float:
     return exp - time.time()
 
 
-_SSO_REFRESH_BUFFER_SECS: float = 60.0
+_SSO_REFRESH_BUFFER_SECS = settings.MCP_SSO_REFRESH_BUFFER_SECONDS
 
 _sso_refresh_lock: asyncio.Lock = asyncio.Lock()
 
@@ -385,12 +449,12 @@ async def _do_sso_refresh(
             _user_token_cache[sub] = (new_token, new_rt)
             if EVAL_TOKEN_REFRESH_ENABLED:
                 from deep_agent.aegra.mcp_crypto import encrypt_secret
-                from deep_agent.aegra.redis import cache_get, cache_set
+                from deep_agent.aegra.redis import cache_get, cache_set, run_redis
 
-                if await asyncio.to_thread(cache_get, f"eval:active:{sub}"):
+                if await run_redis(cache_get, f"eval:active:{sub}"):
                     encrypted_rt = encrypt_secret(new_rt)
                     if encrypted_rt:
-                        await asyncio.to_thread(
+                        await run_redis(
                             cache_set, f"eval:refresh:{sub}", encrypted_rt, 3600
                         )
 
@@ -458,32 +522,119 @@ async def _resolve_connection_token(
     )
 
     try:
-        return await get_mcp_credential_resolver().resolve(user_id, name, entry)
-    except NeedsAuthorization:
-        logger.info(
-            "[%s] no usable OAuth token during connection token resolution",
+        # Renew early here. Discovery runs once per turn and has slack;
+        # a tool call several seconds in does not. Without this a token
+        # with forty seconds left passes discovery and then fails
+        # mid-turn, and the user is told to reconnect an integration
+        # that was working when they asked.
+        return await get_mcp_credential_resolver().resolve(
+            user_id,
             name,
+            entry,
+            renew_buffer_seconds=settings.MCP_TOKEN_RENEW_BUFFER_SECONDS,
         )
+    except NeedsAuthorization as exc:
+        logger.info(
+            "[%s] no usable OAuth token during connection token resolution (%s)",
+            name,
+            exc.reason,
+        )
+        # Recorded here, not only where a tool call fails.
+        #
+        # The agent is told which servers are connected, so when one
+        # is not it declines in prose without ever calling a tool —
+        # "Jira is not connected, please connect it in Settings".
+        # Nothing failed, so nothing was recorded, so the UI had
+        # nothing to offer a button for. Discovery is the point where
+        # we know, regardless of what the model then decides to do.
+        from deep_agent.aegra.mcp_tool_auth import record_auth_request
+
+        record_auth_request(exc)
         return None
+
+
+def _bearer_refresher(
+    name: str,
+    entry: dict[str, Any],
+    auth_mode: str,
+    user_id: str | None,
+) -> Any:
+    """An async callable giving this server's current access token.
+
+    Only for the per-user OAuth modes. An SSO bearer belongs to the
+    request that carried it and a client-credentials token is already
+    cached by the resolver, so neither needs re-resolving per request.
+    """
+    if auth_mode not in ("oauth", "dcr") or not user_id:
+        return None
+
+    async def _current() -> str | None:
+        from deep_agent.aegra.mcp_auth import get_mcp_credential_resolver
+
+        return await get_mcp_credential_resolver().resolve(user_id, name, entry)
+
+    return _current
+
+
+class _FreshBearer(httpx.Auth):
+    """Attach the access token per request, not per graph build.
+
+    Dataverse issues a 300-second access token. A turn routinely runs
+    longer than that — the model alone stalls for 20-60s at a time —
+    so a token baked into the client's headers when the graph was
+    built goes stale partway through. The server answers 401, which
+    the agent reports as "not connected", for an integration the user
+    connected four minutes earlier.
+
+    Asking the resolver each time costs nothing in the common case:
+    it returns the cached token and only touches the network inside
+    the renewal window.
+    """
+
+    def __init__(self, resolve: Any, fallback: str | None) -> None:
+        self._resolve = resolve
+        self._fallback = fallback
+
+    async def async_auth_flow(self, request: httpx.Request) -> Any:
+        token = self._fallback
+        try:
+            fresh = await self._resolve()
+            if fresh:
+                token = fresh
+        except Exception:
+            # A refresh that fails is not a reason to send nothing:
+            # the token in hand may still have seconds left, and a
+            # 401 is a better failure than a malformed request.
+            logger.debug("Could not refresh MCP bearer", exc_info=True)
+        if token:
+            request.headers["Authorization"] = f"Bearer {token}"
+        yield request
 
 
 def _build_server_config(
     entry: dict[str, Any],
     bearer_token: str | None,
+    refresh_bearer: Any = None,
 ) -> dict[str, Any]:
     """Build MultiServerMCPClient config from server definition.
 
     Args:
         entry: Server definition with url, auth, ssl_verify, transport.
         bearer_token: Optional bearer token for this MCP server.
+        refresh_bearer: Optional async callable returning a current
+            token. When given, the token is attached per request so a
+            long turn cannot outlive it.
 
     Returns:
         Config dict for MultiServerMCPClient.
     """
     from deep_agent.utils.pylogger import _trace_id_var
 
+    authenticated = bool(entry.get("auth", True)) and bearer_token is not None
     headers: dict[str, str] = {}
-    if entry.get("auth", True) and bearer_token:
+    if authenticated:
+        # Kept as well as the per-request auth: a transport that does
+        # not take an httpx client factory still gets a token.
         headers["Authorization"] = f"Bearer {bearer_token}"
 
     trace_id = _trace_id_var.get()
@@ -497,7 +648,8 @@ def _build_server_config(
     }
 
     # mcp_httpx_verify enforces True in production
-    if not mcp_httpx_verify(entry):
+    verify = mcp_httpx_verify(entry)
+    if not verify:
         from deep_agent.src.settings import settings
 
         if settings.is_production:
@@ -505,25 +657,55 @@ def _build_server_config(
                 "MCP server '%s': ssl_verify forced to True in production",
                 entry.get("name", entry.get("url", "unknown")),
             )
-        else:
-            # Only disable SSL verification in development environments
-            config["httpx_client_factory"] = lambda **kw: httpx.AsyncClient(
-                verify=False, **kw
-            )  # nosec B501 - only in development
+            verify = True
+
+    ours: httpx.Auth | None = (
+        _FreshBearer(refresh_bearer, bearer_token)
+        if authenticated and refresh_bearer is not None
+        else None
+    )
+
+    if ours is not None or not verify:
+
+        def _factory(
+            auth: httpx.Auth | None = None,
+            _ours: httpx.Auth | None = ours,
+            _verify: bool = verify,
+            **kw: Any,
+        ) -> httpx.AsyncClient:
+            # The SDK passes its own `auth` (normally None); ours only
+            # fills the gap so an explicit one is never overridden.
+            return httpx.AsyncClient(  # nosec B501 - verify is forced True in prod
+                verify=_verify,
+                auth=auth or _ours,
+                **kw,
+            )
+
+        config["httpx_client_factory"] = _factory
 
     return config
 
 
 def _create_auth_placeholder_tool(
-    mcp_name: str, server_cfg: dict[str, Any] | None = None
+    mcp_name: str,
+    server_cfg: dict[str, Any] | None = None,
+    *,
+    tools_present: bool = False,
 ) -> Any:
-    """Create a stub tool that triggers NeedsAuthorization when called.
+    """Create a stub tool standing in for a server that needs authorizing.
 
-    When an MCP server requires OAuth/DCR but the user hasn't authenticated yet,
-    we inject this placeholder. When the LLM calls it, the stub tries to resolve
-    a token (including refresh). Failed refresh raises NeedsAuthorization, which
-    mcp_tool_auth wraps into a LangGraph interrupt so the UI shows the connect
-    button.
+    When an MCP server requires OAuth/DCR but the user has not
+    authenticated, this is injected in place of its tools. Calling it
+    resolves a token (refreshing if it can); a failed refresh raises
+    NeedsAuthorization, which `mcp_tool_auth` turns into a LangGraph
+    interrupt so the UI can offer the connect button.
+
+    ``tools_present`` says the real tools are in this run's list too.
+    The placeholder is then registered only so that a *resumed* run
+    can still answer a tool call checkpointed against it: resuming
+    rebuilds the graph, and without this the pending call would point
+    at a tool that no longer exists. In that state it never pauses —
+    it just points the model at the real tools.
     """
     from langchain_core.tools import StructuredTool
     from pydantic import BaseModel
@@ -536,43 +718,58 @@ def _create_auth_placeholder_tool(
     svc_desc = (server_cfg or {}).get("description", f"{mcp_name} services")
 
     async def _require_auth(query: str = "") -> str:
+        from langgraph.errors import GraphBubbleUp as _GraphBubbleUp
+
         from deep_agent.aegra.mcp_auth import (
             NeedsAuthorization,
             get_mcp_credential_resolver,
         )
 
+        resolver = get_mcp_credential_resolver()
         user_id = _current_user_id.get()
-        if user_id:
-            resolver = get_mcp_credential_resolver()
-            cfg = _get_server_configs().get(mcp_name, {})
+        if not user_id:
+            raise NeedsAuthorization(mcp_name, resolver.connect_url(mcp_name))
+
+        cfg = _get_server_configs().get(mcp_name, {})
+
+        async def _connected() -> bool:
+            # Resolve (and refresh if needed) rather than has_valid_token():
+            # a leftover refresh token must not skip re-auth after refresh fails.
             try:
-                # Resolve (and refresh if needed) instead of has_valid_token().
-                # A leftover refresh token must not skip re-auth after refresh fails.
                 await resolver.resolve(user_id, mcp_name, cfg)
-                invalidate_mcp_tool_cache(user_id)
-                logger.info(
-                    "[%s] placeholder tool resolved auth — "
-                    "tool cache invalidated, rebuild on next request",
-                    mcp_name,
-                )
-                return (
-                    f"Successfully connected to {mcp_name}. "
-                    f"The tools are now available — please ask the user to "
-                    f"repeat their request so the updated tools can be loaded."
-                )
+                return True
             except NeedsAuthorization:
+                return False
+            except _GraphBubbleUp:
                 raise
             except Exception:
                 logger.warning(
                     "[%s] placeholder tool auth resolve failed "
-                    "— falling through to NeedsAuthorization",
+                    "— treating as not connected",
                     mcp_name,
                     exc_info=True,
                 )
+                return False
 
-        raise NeedsAuthorization(
-            mcp_name,
-            get_mcp_credential_resolver().connect_url(mcp_name),
+        if not await _connected():
+            # Raise, do not pause here. The wrapper this tool is handed
+            # to turns NeedsAuthorization into the interrupt, and it is
+            # the only place that knows whether the pause already
+            # happened once in this call. Pausing in both places asked
+            # twice and recorded the cooldown twice.
+            raise NeedsAuthorization(mcp_name, resolver.connect_url(mcp_name))
+
+        invalidate_mcp_tool_cache(user_id)
+        if tools_present:
+            # Already usable in this run; nothing to reload.
+            return (
+                f"{mcp_name} is connected and its tools are "
+                f"available in this turn. Call them directly."
+            )
+        return (
+            f"[TOOLS_RELOADED mcp={mcp_name}] {mcp_name} is now "
+            f"available in this run. Call its tools directly and "
+            f"answer the question. Do not ask the user for anything."
         )
 
     return StructuredTool(
@@ -790,13 +987,12 @@ def invalidate_mcp_tool_cache(user_id: str | None = None) -> None:
         prefix = f"{user_id}:"
         keys = [k for k in _cached_tools if k is not None and k.startswith(prefix)]
         for k in keys:
-            _cached_tools.pop(k, None)
-            _cached_tools_ts.pop(k, None)
-            _cached_connected_set.pop(k, None)
+            _forget_cached_tools(k)
     else:
         _cached_tools.clear()
         _cached_tools_ts.clear()
         _cached_connected_set.clear()
+        _refreshing.clear()
 
 
 async def get_mcp_tools(
@@ -838,7 +1034,7 @@ async def get_mcp_tools(
     cached = _cached_tools.get(cache_key) if cache_key else None
     cached_ts = _cached_tools_ts.get(cache_key, 0.0) if cache_key else 0.0
 
-    from deep_agent.aegra.redis import cache_expire, cache_smembers
+    from deep_agent.aegra.redis import cache_expire, cache_smembers, run_redis
 
     auth_set_key = f"mcp_auth_set:{settings.agent_deployment_id}:{user_id}"
 
@@ -882,6 +1078,7 @@ async def get_mcp_tools(
             finally:
                 _refreshing.discard(key)
 
+        _touch_cached_tools(cache_key)
         logger.info(
             "MCP tool cache stale for %s — serving %d cached tools and "
             "refreshing in the background",
@@ -892,10 +1089,11 @@ async def get_mcp_tools(
         return cached
 
     if cached and len(cached) > 0 and (time.time() - cached_ts) < _MCP_TOOL_CACHE_TTL:
-        redis_set = await asyncio.to_thread(cache_smembers, auth_set_key)
+        _touch_cached_tools(cache_key)
+        redis_set = await run_redis(cache_smembers, auth_set_key)
         if redis_set is None:
             return cached
-        await asyncio.to_thread(cache_expire, auth_set_key, _MCP_AUTH_SET_TTL)
+        await run_redis(cache_expire, auth_set_key, _MCP_AUTH_SET_TTL)
         local_set = _cached_connected_set.get(cache_key, set())
         if redis_set == local_set:
             logger.info(
@@ -912,9 +1110,7 @@ async def get_mcp_tools(
                 local_set,
                 cache_key,
             )
-            _cached_tools.pop(cache_key, None)
-            _cached_tools_ts.pop(cache_key, None)
-            _cached_connected_set.pop(cache_key, None)
+            _forget_cached_tools(cache_key)
 
     servers: dict[str, dict[str, Any]] = _get_server_configs()
     enabled: dict[str, dict[str, Any]] = {
@@ -932,9 +1128,7 @@ async def get_mcp_tools(
     )
 
     pre_discovery_set = (
-        await asyncio.to_thread(cache_smembers, auth_set_key)
-        if cache_key is not None
-        else None
+        await run_redis(cache_smembers, auth_set_key) if cache_key is not None else None
     )
 
     has_auth: bool = bool(sso_token or user_id)
@@ -942,6 +1136,9 @@ async def get_mcp_tools(
     try:
         connect_jobs = []
         placeholder_tools: list[list[Any]] = []
+        # Servers we are about to connect to, in job order.
+        resume_placeholders: dict[str, dict[str, Any]] = {}
+        connect_order: list[str] = []
         for name, entry in enabled.items():
             mcp_prefix_name = entry.get("tool_prefix") or name
             bearer = await _resolve_connection_token(name, entry, sso_token, user_id)
@@ -959,10 +1156,17 @@ async def get_mcp_tools(
                     )
                 )
                 continue
+
+            resume_placeholders[name] = entry
+            connect_order.append(name)
             connect_jobs.append(
                 _connect_single_server(
                     name=mcp_prefix_name,
-                    config=_build_server_config(entry, bearer),
+                    config=_build_server_config(
+                        entry,
+                        bearer,
+                        _bearer_refresher(name, entry, auth_mode, user_id),
+                    ),
                     server_cfg=entry,
                     timeout=entry.get("timeout", 30),
                     required=has_auth,
@@ -970,6 +1174,32 @@ async def get_mcp_tools(
                 )
             )
         results: list[list[Any]] = await asyncio.gather(*connect_jobs)
+
+        # A resume placeholder, but only where the server answered.
+        #
+        # A run that paused on an auth placeholder resumes into a
+        # freshly built graph holding the real tools; without the
+        # placeholder still present the checkpointed call points at a
+        # tool that no longer exists and the resume fails. Added only
+        # for servers that actually connected — standing one in for a
+        # server that is down would claim it is usable.
+        for name, tool_list in zip(connect_order, results, strict=False):
+            if not tool_list:
+                continue
+            resume_entry = resume_placeholders.get(name)
+            if resume_entry is None:
+                continue
+            placeholder_tools.append(
+                prepare_tools_for_model(
+                    [
+                        _create_auth_placeholder_tool(
+                            name, resume_entry, tools_present=True
+                        )
+                    ],
+                    name,
+                )
+            )
+
         results.extend(placeholder_tools)
     finally:
         _mcp_tool_discovery.reset(discovery_token)
@@ -1002,12 +1232,12 @@ async def get_mcp_tools(
         return []
 
     if cache_key is not None:
-        _cached_tools[cache_key] = tools
-        _cached_tools_ts[cache_key] = time.time()
-        _cached_connected_set[cache_key] = (
+        _store_cached_tools(
+            cache_key,
+            tools,
             pre_discovery_set
             if pre_discovery_set is not None
-            else _cached_connected_set.get(cache_key, set())
+            else _cached_connected_set.get(cache_key, set()),
         )
     logger.info(
         "Loaded %d MCP tool(s): %s (cached for %.0fs, user=%s)",
@@ -1016,4 +1246,83 @@ async def get_mcp_tools(
         _MCP_TOOL_CACHE_TTL,
         cache_key or "anonymous",
     )
+    _log_tool_budget(tools)
     return tools
+
+
+# Every bound tool's schema goes into the system prompt on every model
+# call. Measured on this agent by PromptSizeMiddleware: 331 tools are
+# 615,705 characters of schema, 98.2% of everything sent, against
+# 11,040 characters of system prompt. That call recorded 119,769
+# input tokens — about 362 per tool, paid per turn, per user, whether
+# a tool is used or not.
+#
+# The count doubled from 193 to 322 without anyone noticing, because
+# nothing reported what it cost. That is what this threshold is for:
+# not to block a server, but to make growth visible at the moment it
+# happens rather than on a bill.
+_TOOL_BUDGET_WARN = int(os.environ.get("MCP_TOOL_BUDGET_WARN", "120"))
+# Calibrated against recorded input tokens, not a character
+# count: character/4 overestimates JSON schema by about a third.
+_APPROX_TOKENS_PER_TOOL = settings.MCP_APPROX_TOKENS_PER_TOOL
+
+
+def _log_tool_budget(tools: list[Any]) -> None:
+    """Report the prompt cost of the bound tool set, per server."""
+    if not tools:
+        return
+
+    by_server: dict[str, int] = {}
+    chars_by_server: dict[str, int] = {}
+    for tool in tools:
+        name = getattr(tool, "name", "") or ""
+        # `prepare_tools_for_model` stamps the owning server onto
+        # tool.metadata, which is the authoritative attribution.
+        # Parsing the name instead looked right and was wrong twice:
+        # once bucketing everything under "mcp", then bucketing all
+        # 319 discovered tools as built-ins, because only the auth
+        # placeholders actually carry an `mcp__` prefix.
+        metadata = getattr(tool, "metadata", None)
+        server = None
+        if isinstance(metadata, dict):
+            server = metadata.get("mcp_server")
+        if not server:
+            parts = name.split("__")
+            server = parts[1] if len(parts) >= 2 and parts[0] == "mcp" else None
+        server = server or "(built-in)"
+        by_server[server] = by_server.get(server, 0) + 1
+        # Count is the wrong unit on its own: schemas differ by an
+        # order of magnitude, so "which server to drop" is a question
+        # about bytes, not tool count.
+        size = len(name) + len(str(getattr(tool, "description", "") or ""))
+        schema = getattr(tool, "args_schema", None)
+        if schema is not None:
+            size += len(str(schema))
+        chars_by_server[server] = chars_by_server.get(server, 0) + size
+
+    total = len(tools)
+    estimate = total * _APPROX_TOKENS_PER_TOOL
+    # Ordered by cost, so the first entry is the first thing to
+    # consider dropping.
+    breakdown = ", ".join(
+        f"{server}={by_server[server]}t/{chars // 4}tok"
+        for server, chars in sorted(chars_by_server.items(), key=lambda kv: -kv[1])
+    )
+
+    if total >= _TOOL_BUDGET_WARN:
+        logger.warning(
+            "Tool budget: %d tools ≈ %d input tokens per model call, "
+            "paid on every turn whether used or not. Breakdown: %s. "
+            "Scope servers per subagent to cut this — see "
+            "docs/scalability.md.",
+            total,
+            estimate,
+            breakdown,
+        )
+    else:
+        logger.info(
+            "Tool budget: %d tools ≈ %d input tokens per call (%s)",
+            total,
+            estimate,
+            breakdown,
+        )

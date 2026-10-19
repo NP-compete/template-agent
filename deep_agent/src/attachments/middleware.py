@@ -14,13 +14,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
 # Keep the note short. It is prepended to every model call on a thread
 # with attachments, so verbosity here is paid for repeatedly.
-_MAX_LISTED = 20
+_MAX_LISTED = settings.ATTACHMENT_MAX_LISTED
 
 
 def build_notice(paths: list[str]) -> str:

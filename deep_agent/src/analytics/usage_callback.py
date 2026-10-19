@@ -17,6 +17,7 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 
 from deep_agent.src.analytics.usage import record_llm_usage
 from deep_agent.src.token_budget.service import (
+    extract_cached_tokens,
     extract_tokens_from_llm_result,
     extract_tokens_from_message,
 )
@@ -106,6 +107,7 @@ class UsageRecorderCallbackHandler(AsyncCallbackHandler):
             _model_from_response(response),
             input_tokens,
             output_tokens,
+            extract_cached_tokens(response),
         )
 
 

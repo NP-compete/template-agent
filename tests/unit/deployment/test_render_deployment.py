@@ -8,6 +8,7 @@ places. The test that matters most is the drift check — if someone edits
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from scripts.render_deployment import (
     COMPONENT_PATHS,
@@ -18,8 +19,6 @@ from scripts.render_deployment import (
     render_patches,
     rewrite_components,
 )
-
-import yaml
 
 VALUES = yaml.safe_load(
     (REPO_ROOT / "config" / "agent" / "deployment" / "values.yaml").read_text()
@@ -75,12 +74,66 @@ class TestValuesReachTheManifests:
     def test_hpa_bounds_come_from_values(self, openshift):
         spec = openshift["HorizontalPodAutoscaler/agent"]["spec"]
         assert spec["maxReplicas"] == VALUES["autoscaling"]["maxReplicas"]
-        targets = [
-            m["resource"]["target"]["averageUtilization"] for m in spec["metrics"]
+        targets = {
+            m["resource"]["name"]: m["resource"]["target"]["averageUtilization"]
+            for m in spec["metrics"]
+            if m["type"] == "Resource"
+        }
+        assert targets == {
+            "cpu": VALUES["autoscaling"]["targetCPUUtilizationPercentage"]
+        }
+
+    def test_no_memory_target(self, openshift):
+        """Memory is a footprint here, not a load signal.
+
+        An idle pod is already ~1223 MiB because the import graph is
+        resident before the first request. The HPA acts on the
+        highest recommendation across its metrics, so a memory
+        target does not sit harmlessly beside the others — it
+        overrides them, and held the fleet at maxReplicas regardless
+        of demand.
+        """
+        spec = openshift["HorizontalPodAutoscaler/agent"]["spec"]
+        names = [
+            m["resource"]["name"] for m in spec["metrics"] if m["type"] == "Resource"
         ]
-        assert targets == [
-            VALUES["autoscaling"]["targetCPUUtilizationPercentage"],
-            VALUES["autoscaling"]["targetMemoryUtilizationPercentage"],
+        assert "memory" not in names
+        assert "targetMemoryUtilizationPercentage" not in VALUES["autoscaling"]
+
+    def test_memory_request_matches_measured_baseline(self, openshift):
+        """Under-requesting by 2.4x overcommits every node it lands on."""
+        container = openshift["Deployment/agent"]["spec"]["template"]["spec"][
+            "containers"
+        ][0]
+        assert container["resources"]["requests"]["memory"] == "1536Mi"
+
+    def test_hpa_scales_on_runs_in_flight(self, openshift):
+        """CPU alone never crosses its target under the load that hurts.
+
+        An agent turn is almost all waiting on a model, so a pod can
+        hold a hundred runs at low CPU while the pools saturate. The
+        Pods metric is the one that tracks it; CPU and memory stay as
+        a fallback for when the custom-metrics adapter is absent.
+        """
+        spec = openshift["HorizontalPodAutoscaler/agent"]["spec"]
+        pods = [m for m in spec["metrics"] if m["type"] == "Pods"]
+        assert len(pods) == 1
+        assert pods[0]["pods"]["metric"]["name"] == "aegra_runs_in_flight"
+        assert pods[0]["pods"]["target"]["averageValue"] == str(
+            VALUES["autoscaling"]["targetRunsInFlightPerPod"]
+        )
+
+    def test_long_runs_get_time_to_drain(self, openshift):
+        """A turn can outlast the old 60s grace period."""
+        pod = openshift["Deployment/agent"]["spec"]["template"]["spec"]
+        assert (
+            pod["terminationGracePeriodSeconds"]
+            == VALUES["drain"]["terminationGracePeriodSeconds"]
+        )
+        container = pod["containers"][0]
+        assert container["lifecycle"]["preStop"]["exec"]["command"] == [
+            "sleep",
+            str(VALUES["drain"]["preStopSleepSeconds"]),
         ]
 
 

@@ -9,11 +9,12 @@ spec:
   replicas: 2
   template:
     spec:
+      terminationGracePeriodSeconds: 600
       containers:
       - name: agent
         resources:
           requests:
-            memory: 512Mi
+            memory: 1536Mi
             cpu: 250m
           limits:
             memory: 2Gi
@@ -22,9 +23,9 @@ spec:
           httpGet:
             path: /health
           initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
+          periodSeconds: 20
+          timeoutSeconds: 10
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /health
@@ -38,6 +39,12 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
           failureThreshold: 12
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sleep
+              - '15'
 ---
 apiVersion: v1
 kind: Service

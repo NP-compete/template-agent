@@ -22,7 +22,7 @@ logger = get_python_logger()
 
 router = APIRouter(tags=["sharing"])
 
-_TIMEOUT = 30
+_TIMEOUT = settings.SHARE_REQUEST_TIMEOUT_SECONDS
 
 
 class ShareRequest(BaseModel):
@@ -48,7 +48,7 @@ async def share_thread(
     # checkpoint tables — same reasoning as forking: the storage layout
     # moves, the protocol does not.
     async with httpx.AsyncClient(
-        base_url=f"http://127.0.0.1:{settings.AGENT_PORT}",
+        base_url=settings.loopback_base_url,
         headers=headers,
         timeout=_TIMEOUT,
     ) as client:
