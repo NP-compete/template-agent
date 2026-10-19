@@ -132,6 +132,50 @@ def _probes(probes: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _pod_labels(values: dict[str, Any]) -> dict[str, str]:
+    """The recommended Kubernetes labels, for the pod template.
+
+    Not the `app`/`component` pair already on the Deployment: those are
+    the selector, and a selector cannot be changed on a live workload.
+    These go on the pod template only, which is where log and metric
+    collectors read service identity from.
+
+    `version` is the one that earns its place. Without it a metrics
+    backend cannot split a series by release, so "did the rollout cause
+    this" is answered by eye against a deploy timestamp.
+    """
+    labels = {
+        "app.kubernetes.io/name": _get(values, "app.serviceName")
+        or _get(values, "app.name", "agent"),
+        "app.kubernetes.io/component": _get(values, "app.component", "agent"),
+        "app.kubernetes.io/version": str(_get(values, "image.tag", "latest")),
+        "app.kubernetes.io/part-of": _get(values, "app.partOf"),
+        "app.kubernetes.io/managed-by": "kustomize",
+    }
+    return {k: str(v) for k, v in labels.items() if v}
+
+
+def _rollout(values: dict[str, Any]) -> dict[str, Any]:
+    """Deployment-level rollout fields from the `rollout:` block."""
+    rollout = _get(values, "rollout", {}) or {}
+    spec: dict[str, Any] = {}
+
+    surge = rollout.get("maxSurge")
+    unavailable = rollout.get("maxUnavailable")
+    if surge is not None or unavailable is not None:
+        rolling: dict[str, Any] = {}
+        if surge is not None:
+            rolling["maxSurge"] = surge
+        if unavailable is not None:
+            rolling["maxUnavailable"] = unavailable
+        spec["strategy"] = {"type": "RollingUpdate", "rollingUpdate": rolling}
+
+    for field in ("minReadySeconds", "progressDeadlineSeconds"):
+        if rollout.get(field) is not None:
+            spec[field] = int(rollout[field])
+    return spec
+
+
 def _agent_patch(values: dict[str, Any]) -> dict[str, Any] | None:
     """Replicas, resources and probes on the agent Deployment.
 
@@ -162,7 +206,7 @@ def _agent_patch(values: dict[str, Any]) -> dict[str, Any] | None:
             "preStop": {"exec": {"command": ["sleep", str(int(delay))]}}
         }
 
-    spec: dict[str, Any] = {}
+    spec: dict[str, Any] = _rollout(values)
     replicas = _get(values, "app.replicas")
     if replicas is not None and not _get(values, "components.scaleToZero", False):
         # Patches apply after components, so a replica count here would
@@ -170,8 +214,15 @@ def _agent_patch(values: dict[str, Any]) -> dict[str, Any] | None:
         spec["replicas"] = int(replicas)
     if len(container) > 1:
         pod_spec["containers"] = [container]
+
+    template: dict[str, Any] = {}
+    labels = _pod_labels(values)
+    if labels:
+        template["metadata"] = {"labels": labels}
     if pod_spec:
-        spec["template"] = {"spec": pod_spec}
+        template["spec"] = pod_spec
+    if template:
+        spec["template"] = template
 
     if not spec:
         return None

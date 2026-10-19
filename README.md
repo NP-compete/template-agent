@@ -434,6 +434,10 @@ OpenShift manifests are in `deployment/overlays/openshift/`. Local full-stack Ku
 ## Links
 
 - [Skills](docs/skills.md) — building skills from prose corpora and datasets
+- [Observability](docs/observability.md) — where each signal goes, and the keys that join them
+- [SLOs](docs/slo.md) — the four SLIs; targets are yours to set
+- [Runbook](docs/runbook.md) — symptoms, releases, rollbacks
+- [Postmortem template](docs/postmortem.md) — copy per incident
 - [Document extraction](docs/extraction.md) — optional Docling/Tika engines
 - [Usage analytics](docs/analytics.md) — `/analytics/*`, derived, no message content
 - [Tags and sharing](docs/tags-and-sharing.md) — organising and publishing conversations

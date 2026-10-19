@@ -201,8 +201,10 @@ spec:
             periodSeconds: 5
             failureThreshold: 30
           livenessProbe:
+            # /livez: liveness must not depend on Postgres. See the
+            # `probes:` block in config/agent/deployment/values.yaml.
             httpGet:
-              path: /health
+              path: /livez
               port: 5002
             initialDelaySeconds: 30
             periodSeconds: 10

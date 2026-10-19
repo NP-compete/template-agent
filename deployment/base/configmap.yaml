@@ -20,5 +20,26 @@ data:
   # one replica. Aegra itself defaults this to false.
   REDIS_BROKER_ENABLED: "true"
 
+  # OTLP export of metrics and spans. Off by default because the
+  # template cannot know what receives them, but declared here so the
+  # knob is visible: the agent is instrumented either way, and with
+  # this false everything deep_agent/aegra/otel.py records — time to
+  # first token, stream errors, conversation duration — stays in the
+  # in-memory reader and leaves the pod only via /api/metrics.
+  #
+  # Set the endpoint to the OTLP receiver in your cluster (a collector,
+  # or a vendor agent's OTLP ingest) and flip ENABLE_OTEL. The SLIs in
+  # docs/slo.md are unmeasurable until you do.
+  ENABLE_OTEL: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_METRIC_EXPORT_INTERVAL: "60000"
+
+  # Service identity for traces and metrics. Keep in step with
+  # app.serviceName in config/agent/deployment/values.yaml, which sets
+  # the matching pod labels — a backend that disagrees with itself
+  # about what this service is called cannot join the two.
+  SERVICE_NAME: "agent"
+
   # Note: PostgreSQL and Redis environment variables are added by
   # optional components when postgres or redis components are included

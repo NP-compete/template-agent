@@ -487,7 +487,7 @@ class LangfuseObservabilityProvider:
         self, run_id: str, thread_id: str, user_identity: str | None = None
     ) -> dict[str, Any]:
         """Return Langfuse metadata keys for RunnableConfig injection."""
-        from deep_agent.utils.pylogger import _trace_id_var
+        from deep_agent.utils.pylogger import _trace_id_var, current_otel_ids
 
         metadata: dict[str, Any] = {
             "langfuse_trace_name": _get_trace_name(),
@@ -510,6 +510,14 @@ class LangfuseObservabilityProvider:
         trace_id = _trace_id_var.get()
         if trace_id:
             metadata["trace_id"] = trace_id
+        # And the W3C id alongside it, for the same reason one step on:
+        # `trace_id` reaches the logs, this reaches whatever the spans
+        # were exported to. Langfuse holds the only record of what the
+        # model was actually asked, so it is the one backend that must
+        # be reachable from both of the others.
+        otel_trace_id, _ = current_otel_ids()
+        if otel_trace_id:
+            metadata["otel_trace_id"] = otel_trace_id
         return metadata
 
     def is_enabled(self) -> bool:

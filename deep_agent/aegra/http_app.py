@@ -6,6 +6,7 @@ application and merges core LangGraph Platform routes onto.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -183,11 +184,43 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
+_TRACEPARENT = re.compile(r"^00-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+
+def _inbound_trace_id(request: Request) -> str | None:
+    """The W3C trace id for this request, if there is one.
+
+    Minting a fresh uuid4 when no ``X-Trace-ID`` arrives gives the log
+    line an identifier that exists in no other system — the trace of
+    the same request, wherever it was exported, is filed under the W3C
+    id instead, and nothing joins the two. Preferring the W3C id costs
+    nothing when both are present (``X-Trace-ID`` still wins, so the
+    gateway's contract is unchanged) and makes logs and traces land on
+    one key when only ``traceparent`` is.
+
+    The active span is the better source because the instrumentation
+    has already validated and, where sampling demanded it, replaced
+    the inbound context. The header is parsed only as a fallback for
+    deployments running with OTEL disabled, which is the default.
+    """
+    from deep_agent.utils.pylogger import current_otel_ids
+
+    otel_trace_id, _ = current_otel_ids()
+    if otel_trace_id:
+        return otel_trace_id
+
+    match = _TRACEPARENT.match(request.headers.get("traceparent", "").strip().lower())
+    if match and match.group(1) != "0" * 32:
+        return match.group(1)
+    return None
+
+
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """Extract correlation headers and bind them to the structured log context.
 
     Headers consumed:
     - ``X-Trace-ID``: UI-originated trace identifier
+    - ``traceparent``: W3C trace context, used when X-Trace-ID is absent
     - ``X-Request-ID``: gateway-originated request correlation ID
     - ``X-Org-ID``: organisation owning the agent
     - ``X-Agent-ID``: ``org/name`` agent identifier
@@ -196,7 +229,11 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Any) -> Any:
         """Extract correlation headers and bind to structured log context."""
-        trace_id = request.headers.get("x-trace-id") or uuid4().hex
+        trace_id = (
+            request.headers.get("x-trace-id")
+            or _inbound_trace_id(request)
+            or uuid4().hex
+        )
         request_id = request.headers.get("x-request-id") or uuid4().hex
         org_id = request.headers.get("x-org-id")
         agent_id = request.headers.get("x-agent-id")
