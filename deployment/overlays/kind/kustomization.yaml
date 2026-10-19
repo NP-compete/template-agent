@@ -25,6 +25,7 @@ patches:
   - path: generated.yaml
   - path: datastore-uid-patch.yaml
   - path: configmap-patch.yaml
+  - path: documents-pvc-patch.yaml
 
 labels:
   - pairs:

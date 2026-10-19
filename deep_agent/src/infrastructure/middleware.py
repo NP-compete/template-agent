@@ -13,6 +13,8 @@ import contextvars
 import importlib
 import re
 import time
+from collections.abc import Iterable
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -790,10 +792,27 @@ def _build_per_tool_limits(per_tool: dict[str, int]) -> list[Any]:
     return built
 
 
+# Tools the approval policy refuses for this build.
+#
+# A ContextVar rather than an argument because the exclusion list is
+# assembled in two places — the orchestrator's middleware and each
+# subagent's — and both have to agree. Removing a denied tool from
+# only the orchestrator's `tools` left it reachable from every
+# subagent, which are built from the unfiltered MCP list.
+_policy_denied_tools: ContextVar[tuple[str, ...]] = ContextVar(
+    "policy_denied_tools", default=()
+)
+
+
+def set_policy_denied_tools(names: Iterable[str]) -> None:
+    """Record the tools the approval policy denies for this graph build."""
+    _policy_denied_tools.set(tuple(sorted(set(names))))
+
+
 def _profile_excluded_tools() -> list[str]:
     """Every tool to remove, whatever the reason.
 
-    Two sources, deliberately separate. A harness profile's
+    Three sources, deliberately separate. A harness profile's
     ``excluded_tools`` means the model cannot use it, and the Models
     page shows those as limitations of that model.
     ``middleware.tool_exclusion`` means we removed it on purpose —
@@ -821,6 +840,12 @@ def _profile_excluded_tools() -> list[str]:
                 names.add(str(tool))
     except Exception:
         logger.debug("Could not read configured tool exclusions", exc_info=True)
+
+    # And whatever the approval policy denies. `deny` means the tool
+    # may not run at all, so leaving it out of `interrupt_on` is not
+    # enough: without this it simply ran, unprompted, and under
+    # `effects: dry_run` that is every acting tool.
+    names.update(_policy_denied_tools.get())
 
     return sorted(names)
 

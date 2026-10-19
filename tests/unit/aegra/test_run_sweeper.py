@@ -59,8 +59,13 @@ class TestSweeperRegistration:
             await asyncio.sleep(1.2)
 
         assert resume.await_count >= 1
-        # The age floor keeps it off runs a pod is still shutting down.
-        assert resume.await_args.kwargs == {"min_age_seconds": 45}
+        # The age floor keeps it off runs a pod is still shutting
+        # down, and `startup=False` means an operator who turned
+        # off resume-at-boot still gets the periodic recovery.
+        assert resume.await_args.kwargs == {
+            "min_age_seconds": 45,
+            "startup": False,
+        }
 
     async def test_a_failing_sweep_does_not_kill_the_loop(self):
         calls = {"n": 0}

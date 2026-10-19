@@ -57,8 +57,11 @@ class TestEffectsModeIsReadFromTheTopLevel:
         from deep_agent.src.agent.config.loader import AgentConfig
         from deep_agent.src.agent.config.middleware import ExecutionConfig
 
-        loader = AgentConfig.__new__(AgentConfig)
-
+        # `object.__new__`, not `AgentConfig.__new__`: the class is a
+        # singleton, so the latter hands back the process-wide
+        # instance and stubbing `_ensure_loaded` on it disables config
+        # loading for every test that runs afterwards.
+        loader = object.__new__(AgentConfig)
         loader._execution_config = ExecutionConfig(effects="dry_run")
         loader._ensure_loaded = lambda: None  # type: ignore[method-assign]
         assert loader.get_effects_mode() == "dry_run"
@@ -101,3 +104,46 @@ class TestGraphCacheIsPerUser:
 
     def test_an_anonymous_run_is_its_own_bucket(self):
         assert self._key("") != self._key("alice")
+
+
+class TestDenialReachesEverything:
+    """Removing a denied tool from the orchestrator is not enough.
+
+    Subagents are built from the unfiltered MCP list, and the
+    deepagents built-ins never appear in that list at all. Both stayed
+    reachable when the filter only trimmed the orchestrator's own
+    tools, so `effects: dry_run` still let a subagent write files.
+    """
+
+    @staticmethod
+    def _excluded():
+        from deep_agent.src.infrastructure.middleware import _profile_excluded_tools
+
+        return _profile_excluded_tools()
+
+    def test_denied_names_join_the_shared_exclusion_list(self):
+        from deep_agent.src.infrastructure.middleware import set_policy_denied_tools
+
+        set_policy_denied_tools(["write_file", "dataverse_execute_sql"])
+        try:
+            excluded = self._excluded()
+        finally:
+            set_policy_denied_tools([])
+        assert "write_file" in excluded
+        assert "dataverse_execute_sql" in excluded
+
+    def test_nothing_denied_adds_nothing(self):
+        from deep_agent.src.infrastructure.middleware import set_policy_denied_tools
+
+        set_policy_denied_tools([])
+        before = self._excluded()
+        assert "write_file" not in before
+
+    def test_subagents_read_the_same_list(self):
+        """One source, so the two cannot disagree."""
+        import inspect
+
+        from deep_agent.src.infrastructure import subagents
+
+        source = inspect.getsource(subagents)
+        assert "_build_tool_exclusions(_profile_excluded_tools())" in source

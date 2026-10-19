@@ -278,7 +278,9 @@ async def _clear_input_for_checkpoint_resume(
     return updated
 
 
-async def _resume_interrupted_runs(min_age_seconds: int = 0) -> str:
+async def _resume_interrupted_runs(
+    min_age_seconds: int = 0, *, startup: bool = True
+) -> str:
     """Reset interrupted runs so Aegra's LeaseReaper can recover them.
 
     ``min_age_seconds`` leaves very recent ones alone, so the periodic
@@ -297,7 +299,11 @@ async def _resume_interrupted_runs(min_age_seconds: int = 0) -> str:
 
         if not app_settings.LIFECYCLE_PERSISTENCE_ENABLED:
             return "skipped: lifecycle persistence disabled"
-        if not app_settings.LIFECYCLE_RESUME_ON_STARTUP:
+        # Only the startup call. The periodic sweep answers a
+        # different question — "did anything get stranded since?" —
+        # and turning off resume-at-boot used to silence that too,
+        # leaving an enabled sweep recovering nothing.
+        if startup and not app_settings.LIFECYCLE_RESUME_ON_STARTUP:
             return "skipped: resume on startup disabled"
 
         import psycopg
@@ -391,7 +397,8 @@ def _start_interrupted_run_sweeper() -> str:
             await asyncio.sleep(interval)
             try:
                 result = await _resume_interrupted_runs(
-                    min_age_seconds=app_settings.LIFECYCLE_SWEEP_MIN_AGE_SECONDS
+                    min_age_seconds=app_settings.LIFECYCLE_SWEEP_MIN_AGE_SECONDS,
+                    startup=False,
                 )
                 if not result.startswith("ok: no recoverable"):
                     logger.info("Interrupted-run sweep: %s", result)

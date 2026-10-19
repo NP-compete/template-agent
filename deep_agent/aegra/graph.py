@@ -559,6 +559,33 @@ async def agent(runtime: ServerRuntime) -> Any:
 
     logger.warning("Graph cache MISS — full rebuild")
 
+    # A denied tool is taken away everywhere, before anything is built.
+    #
+    # `build_interrupt_on` recorded denials and returned only the
+    # approval map, so a tool the policy refuses outright simply ran.
+    # Filtering the orchestrator's own list was not enough either:
+    # subagents are built from the unfiltered MCP list below, and the
+    # deepagents built-ins never appear in it at all. Feeding the
+    # names into the shared tool-exclusion middleware covers the
+    # orchestrator, every subagent and the built-ins together.
+    if hitl and hitl.enabled:
+        from deep_agent.src.agent.config.hitl import denied_tool_names
+        from deep_agent.src.infrastructure.middleware import (
+            set_policy_denied_tools,
+        )
+
+        denied = denied_tool_names(hitl, tools, effects=effects_mode)
+        set_policy_denied_tools(denied)
+        if denied:
+            logger.warning(
+                "Denying %d tool(s) by approval policy (effects=%s): %s",
+                len(denied),
+                effects_mode,
+                sorted(denied),
+            )
+            tools = [t for t in tools if getattr(t, "name", None) not in denied]
+            mcp_tools = [t for t in mcp_tools if getattr(t, "name", None) not in denied]
+
     subagents = load_subagents(tools=mcp_tools)
     backend = get_configured_backend()
 
@@ -663,27 +690,6 @@ async def agent(runtime: ServerRuntime) -> Any:
                 create_kwargs["permissions"] = permissions
         except (ImportError, TypeError):
             pass
-
-    # A denied tool is removed, not merely un-approved.
-    #
-    # `build_interrupt_on` recorded the denials and returned only the
-    # interrupt map, and this call passed no `effects` — so a tool the
-    # policy refuses outright stayed in the model's hands and ran
-    # without ever reaching an approval prompt, and `effects: dry_run`
-    # did nothing at all. Both axes are applied here now, before the
-    # tool list reaches the agent.
-    if hitl and hitl.enabled:
-        from deep_agent.src.agent.config.hitl import denied_tool_names
-
-        denied = denied_tool_names(hitl, tools, effects=effects_mode)
-        if denied:
-            logger.warning(
-                "Removing %d tool(s) denied by approval policy (effects=%s): %s",
-                len(denied),
-                effects_mode,
-                sorted(denied),
-            )
-            tools = [t for t in tools if getattr(t, "name", None) not in denied]
 
     if hitl and hitl.enabled and "interrupt_on" in create_sig.parameters:
         try:
