@@ -154,6 +154,7 @@ async def enter_mcp_session_scope() -> None:
     if _open_sessions.get() is None:
         cache: dict[tuple[str, str], Any] = {}
         _open_sessions.set(cache)
+        await _evict_old_session_stacks()
         _session_stacks[id(cache)] = AsyncExitStack()
 
 
@@ -177,6 +178,30 @@ async def mcp_session_scope() -> AsyncIterator[None]:
 
 
 _session_stacks: dict[int, AsyncExitStack] = {}
+
+# How many turn-scoped stacks may be held at once.
+#
+# `enter_mcp_session_scope` has no matching exit on purpose — the
+# graph is built in the request context and runs in a worker task —
+# so nothing ever removed its entry and the dict, with the MCP
+# sessions each stack holds open, grew for the life of the process.
+# The reuse-within-a-turn trade stands; the unbounded growth was not
+# part of it. Oldest entries are closed first, and a stack still in
+# use by a live turn is within this many turns of being created.
+_MAX_SESSION_STACKS = 32
+
+
+async def _evict_old_session_stacks() -> None:
+    """Close the oldest stacks once there are more than the cap."""
+    while len(_session_stacks) >= _MAX_SESSION_STACKS:
+        _, stack = next(iter(_session_stacks.items()))
+        _session_stacks.pop(next(iter(_session_stacks)), None)
+        try:
+            await stack.aclose()
+        except Exception:
+            # A stack whose task is already gone raises on close.
+            # Dropping the reference is the point; the error is not.
+            logger.debug("Could not close an expired MCP session stack", exc_info=True)
 
 
 @asynccontextmanager

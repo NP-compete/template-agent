@@ -312,6 +312,25 @@ spec:
               value: "/app/data/documents"
             - name: DOCUMENTS_MAX_BYTES
               value: "524288000"
+            # A Fernet key — 32 url-safe base64 bytes, not hex:
+            #   python -c "from cryptography.fernet import Fernet; \
+            #              print(Fernet.generate_key().decode())"
+            # In its own Secret so `oc apply -k` cannot reset it:
+            #   oc -n <namespace> create secret generic agent-mcp-key \
+            #     --from-file=MCP_TOKEN_ENCRYPTION_KEY=./key.txt
+            #
+            # The Kind overlay has carried this since MCP OAuth
+            # landed and OpenShift did not, so Connect reached the
+            # provider, came back, and failed where the token is
+            # written — on the cluster that actually has users.
+            # Optional, so a deployment with no OAuth servers starts
+            # without it.
+            - name: MCP_TOKEN_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-mcp-key
+                  key: MCP_TOKEN_ENCRYPTION_KEY
+                  optional: true
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

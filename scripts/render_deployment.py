@@ -297,7 +297,12 @@ def _hpa_patch(values: dict[str, Any]) -> dict[str, Any] | None:
             {
                 "type": "Pods",
                 "pods": {
-                    "metric": {"name": "aegra_runs_in_flight"},
+                    # The per-pod gauge, not the cluster-wide one.
+                    # A `Pods` metric averages across replicas, and
+                    # every replica reports the same cluster total,
+                    # so the average never fell as pods were added
+                    # and the HPA ratcheted to maxReplicas.
+                    "metric": {"name": "aegra_runs_in_flight_pod"},
                     "target": {
                         "type": "AverageValue",
                         "averageValue": str(in_flight),

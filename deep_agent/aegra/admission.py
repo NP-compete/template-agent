@@ -74,5 +74,42 @@ class AdmissionControlMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        async with self._sem:
-            return await call_next(request)
+        # Held until the body is finished, not until it starts.
+        #
+        # `call_next` returns as soon as the response begins, so
+        # `async with` released the permit before a `/runs/stream`
+        # had sent anything. Only `/runs/wait`, which returns at the
+        # end, was ever actually limited. For a streaming response
+        # the permit is released when the iterator is exhausted or
+        # the client goes away.
+        #
+        # A backgrounded `/runs` is still not bounded here: it
+        # returns immediately by design and the run continues in a
+        # worker, so the worker pool is what limits those.
+        await self._sem.acquire()
+        released = False
+        try:
+            response = await call_next(request)
+        except BaseException:
+            self._sem.release()
+            raise
+
+        iterator = getattr(response, "body_iterator", None)
+        if iterator is None:
+            self._sem.release()
+            return response
+
+        sem = self._sem
+
+        async def _release_when_done() -> Any:
+            nonlocal released
+            try:
+                async for chunk in iterator:
+                    yield chunk
+            finally:
+                if not released:
+                    released = True
+                    sem.release()
+
+        response.body_iterator = _release_when_done()
+        return response

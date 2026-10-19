@@ -36,6 +36,7 @@ REFRESH_INTERVAL_SECONDS = settings.INFLIGHT_METRIC_INTERVAL_SECONDS
 _ACTIVE_STATUSES = ("pending", "running")
 
 _gauge: Any = None
+_pod_gauge: Any = None
 _task: asyncio.Task[None] | None = None
 
 
@@ -50,6 +51,39 @@ def _get_gauge() -> Any:
             "Runs currently pending or running, across all instances",
         )
     return _gauge
+
+
+def _get_pod_gauge() -> Any:
+    """This pod's own share, for the HPA.
+
+    The cluster-wide gauge above is the right input for a scale-to-
+    zero decision, and the wrong one for a `Pods` metric with an
+    `AverageValue` target: every replica reports the same total, so
+    the per-pod average never falls as replicas are added. The HPA
+    computes `ceil(n * total / target)`, which grows with `n`, and
+    the fleet climbed to maxReplicas whenever the total crossed the
+    target and stayed there.
+    """
+    global _pod_gauge  # noqa: PLW0603
+    if _pod_gauge is None:
+        import prometheus_client
+
+        _pod_gauge = prometheus_client.Gauge(
+            "aegra_runs_in_flight_pod",
+            "Runs this instance is executing right now",
+        )
+    return _pod_gauge
+
+
+def count_pod_active_runs() -> int:
+    """Runs this process is executing, from Aegra's in-memory registry."""
+    try:
+        from deep_agent.aegra.lifecycle import _get_active_runs
+
+        return len(_get_active_runs() or {})
+    except Exception:
+        logger.debug("Could not read this pod's active runs", exc_info=True)
+        return 0
 
 
 async def count_active_runs() -> int:
@@ -71,9 +105,11 @@ async def count_active_runs() -> int:
 async def _refresh_loop() -> None:
     """Keep the gauge current until cancelled."""
     gauge = _get_gauge()
+    pod_gauge = _get_pod_gauge()
     while True:
         try:
             gauge.set(await count_active_runs())
+            pod_gauge.set(count_pod_active_runs())
         except asyncio.CancelledError:
             raise
         except Exception as exc:

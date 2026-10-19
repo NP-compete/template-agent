@@ -592,6 +592,7 @@ async def agent(runtime: ServerRuntime) -> Any:
     middleware = build_middleware_list(
         resolved_mw,
         model=model,
+        model_name=str(model_name or ""),
         backend=backend,
         mcp_tool_names=frozenset(t.name for t in mcp_tools)
         | frozenset(t.name for t in resource_tools),

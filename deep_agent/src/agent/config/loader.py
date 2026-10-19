@@ -341,6 +341,34 @@ class AgentConfig:
             raw.get("token_budget", {})
         )
 
+        # Extract the attachment and extraction sections.
+        #
+        # Parsed here, like every other section. The two readers in
+        # `attachment_routes` asked for a `get_raw_section` method
+        # that has never existed on this class, fell through their
+        # `hasattr` guard every time, and so quietly ignored the
+        # configured limits, `mount_path` and extraction engine.
+        from deep_agent.src.attachments.config import (
+            AttachmentsConfig,
+            ExtractionConfig,
+        )
+
+        try:
+            self._attachments_config = AttachmentsConfig.model_validate(
+                raw.get("attachments") or {}
+            )
+        except Exception:
+            logger.warning("Invalid attachments config; using defaults")
+            self._attachments_config = AttachmentsConfig()
+
+        try:
+            self._extraction_config = ExtractionConfig.model_validate(
+                raw.get("extraction") or {}
+            )
+        except Exception:
+            logger.warning("Invalid extraction config; using built-in parsers")
+            self._extraction_config = ExtractionConfig()
+
         # Extract the execution axis. Top level, which is where
         # `validate.py` checks it and where agent.yaml writes it —
         # the only reader looked in the PROMPT.md frontmatter instead
@@ -849,6 +877,16 @@ class AgentConfig:
         """Get the pre-loaded per-thread token budget configuration."""
         self._ensure_loaded()
         return self._token_budget_config
+
+    def get_attachments_config(self) -> Any:
+        """Attachment limits from agent.yaml, defaults when unset."""
+        self._ensure_loaded()
+        return self._attachments_config
+
+    def get_extraction_config(self) -> Any:
+        """Document-extraction engine from agent.yaml."""
+        self._ensure_loaded()
+        return self._extraction_config
 
     def get_effects_mode(self) -> str:
         """Whether this deployment may actually change anything.

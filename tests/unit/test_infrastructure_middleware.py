@@ -944,9 +944,42 @@ class TestExclusionSources:
                 return_value=resolved,
             ),
         ):
-            names = mw._profile_excluded_tools()
+            names = mw._profile_excluded_tools("some-model")
 
         assert names == ["model_cannot_use_this", "removed_by_design"]
+
+    def test_another_model_keeps_the_tool(self):
+        """A profile is per model, so its exclusions are too.
+
+        Every profile used to be merged and the union applied to
+        every agent, which removed a tool from agents running on a
+        model that can use it.
+        """
+        from deep_agent.src.infrastructure import middleware as mw
+
+        profile = MagicMock()
+        profile.excluded_tools = ["model_cannot_use_this"]
+        providers = MagicMock()
+        providers.harness_profiles = {"some-model": profile}
+
+        resolved = MagicMock()
+        resolved.tool_exclusion.enabled = True
+        resolved.tool_exclusion.tools = ["removed_by_design"]
+
+        with (
+            patch.object(mw, "logger", MagicMock()),
+            patch(
+                "deep_agent.src.agent.config.agent_config.get_providers_config",
+                return_value=providers,
+            ),
+            patch(
+                "deep_agent.src.agent.config.agent_config.resolve_agent_middleware",
+                return_value=resolved,
+            ),
+        ):
+            names = mw._profile_excluded_tools("a-different-model")
+
+        assert names == ["removed_by_design"]
 
     def test_a_disabled_exclusion_block_removes_nothing(self):
         from deep_agent.src.infrastructure import middleware as mw

@@ -1002,15 +1002,28 @@ async def handle_mcp_connections(user_id: str) -> dict[str, Any]:
         )
         if not account:
             return None
+        # Re-read before writing. The userinfo or introspection call
+        # above takes a round trip, and a concurrent turn can refresh
+        # the token inside that window. Writing back the pair read
+        # beforehand restored a refresh token the provider had just
+        # rotated away, which revokes it and disconnects the user —
+        # for the sake of filling in a display name.
+        try:
+            current = await store.get_token(
+                stored.agent_name, stored.user_id, stored.mcp_name
+            )
+        except Exception:
+            current = None
+        latest = current or stored
         try:
             await store.upsert_token(
-                agent_name=stored.agent_name,
-                user_id=stored.user_id,
-                mcp_name=stored.mcp_name,
-                access_token=stored.access_token,
-                refresh_token=stored.refresh_token,
-                expires_at=stored.expires_at,
-                scopes=stored.scopes,
+                agent_name=latest.agent_name,
+                user_id=latest.user_id,
+                mcp_name=latest.mcp_name,
+                access_token=latest.access_token,
+                refresh_token=latest.refresh_token,
+                expires_at=latest.expires_at,
+                scopes=latest.scopes,
                 account=account,
             )
         except Exception:

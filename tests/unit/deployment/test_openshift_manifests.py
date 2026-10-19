@@ -461,10 +461,20 @@ class TestScaleToZeroComponent:
 
         scalers = _of_kind(rendered, "ScaledObject")
         assert len(scalers) == 1
-        assert not _of_kind(rendered, "HTTPScaledObject"), (
-            "HTTPScaledObject creates its own ScaledObject; having both "
-            "puts two controllers on the agent Deployment"
-        )
+
+        # The HTTPScaledObject is present, and must not create a
+        # second scaler. It is the add-on's routing table entry, and
+        # without it the interceptor the Route points at has nowhere
+        # to forward: the Route answers 503 at zero replicas, which
+        # is the failure scale-to-zero exists to avoid. The skip
+        # annotation is what keeps one controller on the Deployment.
+        https = _of_kind(rendered, "HTTPScaledObject")
+        assert len(https) == 1, "the interceptor needs its routing entry"
+        annotations = https[0]["metadata"].get("annotations") or {}
+        assert (
+            annotations.get("httpscaledobject.keda.sh/skip-scaledobject-creation")
+            == "true"
+        ), "without this the add-on adds a second scaler on the same Deployment"
 
         triggers = {t["type"] for t in scalers[0]["spec"]["triggers"]}
         assert "external" in triggers, "nothing wakes the pod from zero"

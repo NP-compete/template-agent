@@ -64,23 +64,39 @@ class TestOrchestratorModel:
 
 
 class TestConfigReaders:
-    """A broken config block must not take the endpoint down with it."""
+    """The configured values must actually reach the endpoint.
+
+    These used to mock `get_raw_section`, a method `AgentConfig` has
+    never had. The readers guarded the call with `hasattr`, so in
+    production they fell through to defaults every time and the
+    configured limits, `mount_path` and extraction engine were
+    silently ignored. The tests passed throughout, against a mock of
+    something that did not exist.
+    """
 
     def test_config_reads_the_attachments_section(self):
         cfg = MagicMock()
-        cfg.get_raw_section.return_value = {"max_files_per_request": 3}
+        cfg.get_attachments_config.return_value = ar.AttachmentsConfig(
+            max_files_per_request=3
+        )
         with patch("deep_agent.src.agent.config.agent_config", cfg):
             assert ar._config().max_files_per_request == 3
 
+    def test_extraction_reads_its_section(self):
+        cfg = MagicMock()
+        cfg.get_extraction_config.return_value = ar.ExtractionConfig()
+        with patch("deep_agent.src.agent.config.agent_config", cfg):
+            assert ar._extraction_config() == ar.ExtractionConfig()
+
     def test_config_defaults_when_the_section_is_broken(self):
         cfg = MagicMock()
-        cfg.get_raw_section.side_effect = ValueError("bad yaml")
+        cfg.get_attachments_config.side_effect = ValueError("bad yaml")
         with patch("deep_agent.src.agent.config.agent_config", cfg):
             assert ar._config() == ar.AttachmentsConfig()
 
     def test_extraction_defaults_when_the_section_is_broken(self):
         cfg = MagicMock()
-        cfg.get_raw_section.side_effect = ValueError("bad yaml")
+        cfg.get_extraction_config.side_effect = ValueError("bad yaml")
         with patch("deep_agent.src.agent.config.agent_config", cfg):
             assert ar._extraction_config() == ar.ExtractionConfig()
 

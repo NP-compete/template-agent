@@ -28,6 +28,17 @@ kind: Component
 resources:
   - in-flight-scaledobject.yaml
   - wakeup-cronjob.yaml
+  # Traffic goes through the interceptor, so the add-on needs its
+  # routing table entry for this host. Without the HTTPScaledObject
+  # the interceptor has nowhere to forward to and the Route answers
+  # 503 at zero replicas. It carries
+  # `httpscaledobject.keda.sh/skip-scaledobject-creation: "true"`, so
+  # the metric-based ScaledObject above stays the only scaler.
+  - httpscaledobject.yaml
+  # Reading the metric needs a token, and the Route needs a local
+  # Service to target.
+  - thanos-auth.yaml
+  - interceptor-service.yaml
 
 patches:
   - path: route-patch.yaml

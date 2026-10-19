@@ -759,13 +759,19 @@ def _create_auth_placeholder_tool(
             # twice and recorded the cooldown twice.
             raise NeedsAuthorization(mcp_name, resolver.connect_url(mcp_name))
 
-        invalidate_mcp_tool_cache(user_id)
         if tools_present:
-            # Already usable in this run; nothing to reload.
+            # Already usable in this run, so nothing to reload and
+            # nothing to invalidate. Clearing the cache here undid
+            # stale-while-revalidate on most turns, because the
+            # placeholder's own description tells the model it must
+            # call this, and the next turn then paid for a full
+            # rebuild.
             return (
                 f"{mcp_name} is connected and its tools are "
                 f"available in this turn. Call them directly."
             )
+
+        invalidate_mcp_tool_cache(user_id)
         return (
             f"[TOOLS_RELOADED mcp={mcp_name}] {mcp_name} is now "
             f"available in this run. Call its tools directly and "

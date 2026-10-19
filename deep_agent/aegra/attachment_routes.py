@@ -15,7 +15,7 @@ actually read, and the filename is treated as hostile.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
@@ -63,12 +63,7 @@ def _config() -> AttachmentsConfig:
     try:
         from deep_agent.src.agent.config import agent_config
 
-        raw = (
-            (agent_config.get_raw_section("attachments") or {})
-            if hasattr(agent_config, "get_raw_section")
-            else {}
-        )
-        return AttachmentsConfig(**raw)
+        return cast(AttachmentsConfig, agent_config.get_attachments_config())
     except Exception:
         # A broken attachments block must not take the endpoint down
         # with it; the defaults are the conservative ones.
@@ -81,12 +76,7 @@ def _extraction_config() -> ExtractionConfig:
     try:
         from deep_agent.src.agent.config import agent_config
 
-        raw = (
-            (agent_config.get_raw_section("extraction") or {})
-            if hasattr(agent_config, "get_raw_section")
-            else {}
-        )
-        return ExtractionConfig(**raw)
+        return cast(ExtractionConfig, agent_config.get_extraction_config())
     except Exception:
         # Same reasoning as above, and more strongly: a typo in an
         # optional quality setting must not stop anyone uploading.

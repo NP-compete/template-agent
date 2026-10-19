@@ -146,4 +146,4 @@ class TestDenialReachesEverything:
         from deep_agent.src.infrastructure import subagents
 
         source = inspect.getsource(subagents)
-        assert "_build_tool_exclusions(_profile_excluded_tools())" in source
+        assert "_build_tool_exclusions(_profile_excluded_tools(" in source

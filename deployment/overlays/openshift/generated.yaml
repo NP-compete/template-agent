@@ -77,7 +77,7 @@ spec:
   - type: Pods
     pods:
       metric:
-        name: aegra_runs_in_flight
+        name: aegra_runs_in_flight_pod
       target:
         type: AverageValue
         averageValue: '25'

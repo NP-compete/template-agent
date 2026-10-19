@@ -110,3 +110,100 @@ class TestAdmissionControl:
             hold.set()
             results = await asyncio.gather(*tasks)
         assert [r.status_code for r in results] == [200] * 5
+
+
+class TestThePermitSpansTheWholeResponse:
+    """`call_next` returns when the response starts, not when it ends.
+
+    So `async with self._sem` released the permit before a
+    `/runs/stream` had sent a single token, and the only route this
+    middleware really limited was `/runs/wait`, which returns at the
+    end.
+    """
+
+    @staticmethod
+    def _middleware(max_concurrent: int = 1):
+        from deep_agent.aegra.admission import AdmissionControlMiddleware
+
+        return AdmissionControlMiddleware(app=None, max_concurrent=max_concurrent)
+
+    @staticmethod
+    def _streaming_request():
+        from unittest.mock import MagicMock
+
+        request = MagicMock()
+        request.method = "POST"
+        request.url.path = "/threads/abc/runs/stream"
+        return request
+
+    async def test_the_permit_is_still_held_while_the_body_streams(self):
+        mw = self._middleware()
+
+        async def body():
+            yield b"chunk-1"
+            yield b"chunk-2"
+
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.body_iterator = body()
+
+        async def call_next(_request):
+            return response
+
+        out = await mw.dispatch(self._streaming_request(), call_next)
+        # Started, not finished: nobody else may start a run yet.
+        assert mw._sem.locked()
+
+        chunks = [c async for c in out.body_iterator]
+        assert chunks == [b"chunk-1", b"chunk-2"]
+        # Finished, so the permit is back.
+        assert not mw._sem.locked()
+
+    async def test_a_plain_response_releases_immediately(self):
+        from unittest.mock import MagicMock
+
+        mw = self._middleware()
+        response = MagicMock()
+        del response.body_iterator
+
+        async def call_next(_request):
+            return response
+
+        await mw.dispatch(self._streaming_request(), call_next)
+        assert not mw._sem.locked()
+
+    async def test_a_failure_does_not_strand_the_permit(self):
+        mw = self._middleware()
+
+        async def call_next(_request):
+            raise RuntimeError("upstream died")
+
+        import pytest
+
+        with pytest.raises(RuntimeError):
+            await mw.dispatch(self._streaming_request(), call_next)
+        assert not mw._sem.locked()
+
+    async def test_a_client_that_disconnects_mid_stream_releases(self):
+        mw = self._middleware()
+
+        async def body():
+            yield b"chunk-1"
+            raise ConnectionResetError("client went away")
+
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.body_iterator = body()
+
+        async def call_next(_request):
+            return response
+
+        out = await mw.dispatch(self._streaming_request(), call_next)
+        import pytest
+
+        with pytest.raises(ConnectionResetError):
+            async for _ in out.body_iterator:
+                pass
+        assert not mw._sem.locked()

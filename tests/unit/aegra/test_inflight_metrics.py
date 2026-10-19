@@ -131,3 +131,48 @@ class TestStartupWiring:
             result = startup._start_inflight_metrics()
 
         assert result.startswith("error")
+
+
+class TestPerPodGauge:
+    """A `Pods` HPA metric needs a per-pod number.
+
+    `aegra_runs_in_flight` is the cluster-wide total and every
+    replica publishes the same value, so dividing it by the replica
+    count never falls as replicas are added: the HPA computes
+    `ceil(n * total / target)` and ratchets to maxReplicas.
+    """
+
+    def test_it_counts_this_pods_runs(self):
+        from unittest.mock import patch
+
+        from deep_agent.aegra import inflight_metrics as im
+
+        with patch(
+            "deep_agent.aegra.lifecycle._get_active_runs",
+            return_value={"a": 1, "b": 2},
+        ):
+            assert im.count_pod_active_runs() == 2
+
+    def test_no_runs_is_zero_not_an_error(self):
+        from unittest.mock import patch
+
+        from deep_agent.aegra import inflight_metrics as im
+
+        with patch("deep_agent.aegra.lifecycle._get_active_runs", return_value={}):
+            assert im.count_pod_active_runs() == 0
+
+    def test_an_unreadable_registry_reports_zero(self):
+        from unittest.mock import patch
+
+        from deep_agent.aegra import inflight_metrics as im
+
+        with patch(
+            "deep_agent.aegra.lifecycle._get_active_runs",
+            side_effect=RuntimeError("not ready"),
+        ):
+            assert im.count_pod_active_runs() == 0
+
+    def test_the_two_gauges_are_different_series(self):
+        from deep_agent.aegra import inflight_metrics as im
+
+        assert im._get_gauge() is not im._get_pod_gauge()

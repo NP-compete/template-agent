@@ -66,8 +66,14 @@ spec:
     # `max` not `sum`: the gauge is cluster-wide and reported
     # identically by every replica, so summing would multiply it.
     - type: prometheus
+      # Port 9091 authenticates. Without these the query came back
+      # 401 or 403, the scaler saw nothing, and the guard never held
+      # a replica. See thanos-auth.yaml.
+      authenticationRef:
+        name: keda-trigger-auth-prometheus
       metadata:
-        serverAddress: http://thanos-querier.openshift-monitoring.svc:9091
+        serverAddress: https://thanos-querier.openshift-monitoring.svc:9091
+        authModes: "bearer"
         metricName: aegra_runs_in_flight
         query: max(aegra_runs_in_flight{namespace="NAMESPACE_PLACEHOLDER"})
         threshold: "5"

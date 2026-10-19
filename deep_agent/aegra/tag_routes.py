@@ -68,14 +68,21 @@ def normalise_tag(raw: str) -> str:
 
 
 def normalise_tags(raw: list[str]) -> list[str]:
-    """Normalise, de-duplicate and order a tag list."""
-    seen: list[str] = []
+    """Normalise, de-duplicate and order a tag list.
+
+    A set for membership and the limit checked as it fills: the list
+    version did a linear scan per tag and only rejected the request
+    after normalising all of them, so a caller sending thousands of
+    distinct tags paid for the whole quadratic walk before being told
+    no.
+    """
+    seen: set[str] = set()
     for item in raw:
-        tag = normalise_tag(item)
-        if tag not in seen:
-            seen.append(tag)
-    if len(seen) > MAX_TAGS_PER_THREAD:
-        raise ValueError(f"a conversation may have at most {MAX_TAGS_PER_THREAD} tags")
+        seen.add(normalise_tag(item))
+        if len(seen) > MAX_TAGS_PER_THREAD:
+            raise ValueError(
+                f"a conversation may have at most {MAX_TAGS_PER_THREAD} tags"
+            )
     return sorted(seen)
 
 

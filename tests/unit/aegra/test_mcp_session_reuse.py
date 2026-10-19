@@ -108,3 +108,73 @@ class TestSessionReuse:
                     pass
         assert mcp_host._open_sessions.get() is None
         assert mcp_host._session_stacks == {}
+
+
+class TestSessionStacksAreBounded:
+    """`enter_mcp_session_scope` has no exit, so it must not grow for ever.
+
+    The graph is built in the request context and runs in a worker
+    task, so there is nowhere to close a scope that spans the turn.
+    That trade is deliberate. Nothing removing the entry afterwards
+    was not: the dict, and the MCP sessions each stack holds open,
+    accumulated for the life of the process.
+    """
+
+    async def test_the_stack_table_stops_growing(self):
+        from contextlib import AsyncExitStack
+
+        from deep_agent.aegra import mcp_host as mh
+
+        original = dict(mh._session_stacks)
+        mh._session_stacks.clear()
+        try:
+            for i in range(mh._MAX_SESSION_STACKS * 2):
+                mh._session_stacks[i] = AsyncExitStack()
+                await mh._evict_old_session_stacks()
+            assert len(mh._session_stacks) < mh._MAX_SESSION_STACKS
+        finally:
+            mh._session_stacks.clear()
+            mh._session_stacks.update(original)
+
+    async def test_eviction_closes_what_it_drops(self):
+        from contextlib import AsyncExitStack
+
+        from deep_agent.aegra import mcp_host as mh
+
+        closed: list[str] = []
+
+        class _Tracked(AsyncExitStack):
+            async def aclose(self) -> None:  # type: ignore[override]
+                closed.append("yes")
+
+        original = dict(mh._session_stacks)
+        mh._session_stacks.clear()
+        try:
+            for i in range(mh._MAX_SESSION_STACKS + 2):
+                mh._session_stacks[i] = _Tracked()
+                await mh._evict_old_session_stacks()
+            assert closed, "an evicted stack must be closed, not just dropped"
+        finally:
+            mh._session_stacks.clear()
+            mh._session_stacks.update(original)
+
+    async def test_a_failing_close_does_not_stop_eviction(self):
+        """A stack whose task is gone raises; the entry must still go."""
+        from contextlib import AsyncExitStack
+
+        from deep_agent.aegra import mcp_host as mh
+
+        class _Angry(AsyncExitStack):
+            async def aclose(self) -> None:  # type: ignore[override]
+                raise RuntimeError("task is gone")
+
+        original = dict(mh._session_stacks)
+        mh._session_stacks.clear()
+        try:
+            for i in range(mh._MAX_SESSION_STACKS + 3):
+                mh._session_stacks[i] = _Angry()
+                await mh._evict_old_session_stacks()
+            assert len(mh._session_stacks) < mh._MAX_SESSION_STACKS
+        finally:
+            mh._session_stacks.clear()
+            mh._session_stacks.update(original)

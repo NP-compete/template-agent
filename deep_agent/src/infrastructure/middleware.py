@@ -553,6 +553,7 @@ def build_middleware_list(
     resolved: ResolvedMiddlewareConfig,
     *,
     model: Any | None = None,
+    model_name: str = "",
     backend: Any | None = None,
     mcp_tool_names: frozenset[str] | None = None,
 ) -> list[Any]:
@@ -632,7 +633,7 @@ def build_middleware_list(
             _build_summarization_tool_middleware(model=model, backend=backend),
         )
 
-    _append_guardrails(middlewares, resolved)
+    _append_guardrails(middlewares, resolved, model_name)
 
     for dotted_path in resolved.extra_middleware:
         _append_if_built(middlewares, _import_middleware(dotted_path))
@@ -648,7 +649,11 @@ def _append_if_built(target: list[Any], mw: Any | None) -> None:
         target.append(mw)
 
 
-def _append_guardrails(target: list[Any], resolved: ResolvedMiddlewareConfig) -> None:
+def _append_guardrails(
+    target: list[Any],
+    resolved: ResolvedMiddlewareConfig,
+    model_name: str = "",
+) -> None:
     """Build and append all production guardrail middleware."""
     if resolved.model_call_limit.enabled:
         _append_if_built(
@@ -663,8 +668,8 @@ def _append_guardrails(target: list[Any], resolved: ResolvedMiddlewareConfig) ->
             _append_if_built(target, limiter)
 
     # The orchestrator's copy; subagents build their own list and
-    # apply the same exclusions there.
-    for exclusion in _build_tool_exclusions(_profile_excluded_tools()):
+    # apply the same exclusions there, against their own model.
+    for exclusion in _build_tool_exclusions(_profile_excluded_tools(model_name)):
         _append_if_built(target, exclusion)
 
     if resolved.model_retry.enabled:
@@ -809,7 +814,7 @@ def set_policy_denied_tools(names: Iterable[str]) -> None:
     _policy_denied_tools.set(tuple(sorted(set(names))))
 
 
-def _profile_excluded_tools() -> list[str]:
+def _profile_excluded_tools(model_name: str = "") -> list[str]:
     """Every tool to remove, whatever the reason.
 
     Three sources, deliberately separate. A harness profile's
@@ -819,13 +824,19 @@ def _profile_excluded_tools() -> list[str]:
     its job moved into a skill — which is not a fact about the model
     and must not be shown as one. Enforcement does not care which;
     only the reader does.
+
+    ``model_name`` picks the harness profile, which is keyed by
+    model. Merging every profile applied one model's limitation to
+    agents running on models that do not share it, which is the
+    opposite of what a per-model profile is for.
     """
     names: set[str] = set()
     try:
         from deep_agent.src.agent.config import agent_config
 
         profiles = agent_config.get_providers_config().harness_profiles or {}
-        for profile in profiles.values():
+        profile = profiles.get(model_name) if model_name else None
+        if profile is not None:
             for tool in getattr(profile, "excluded_tools", None) or []:
                 names.add(str(tool))
     except Exception:

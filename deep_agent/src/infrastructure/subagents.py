@@ -335,6 +335,7 @@ def _subagent_middleware(
     name: str,
     resolved_tools: list[Any],
     fallback_mw: list[Any],
+    model_name: str = "",
 ) -> list[Any] | None:
     """Merge audit + OPA middleware with optional fallback middleware."""
     middleware: list[Any] = []
@@ -380,7 +381,10 @@ def _subagent_middleware(
     # parent alone, the exclusion looked right and changed nothing:
     # `identify_dataproducts`, `shortlist_tables` and `get_sql` all
     # ran anyway.
-    middleware.extend(_build_tool_exclusions(_profile_excluded_tools()))
+    # This subagent's own model. Harness profiles are per model, and
+    # merging all of them removed a tool from agents running on a
+    # model that can use it perfectly well.
+    middleware.extend(_build_tool_exclusions(_profile_excluded_tools(model_name)))
 
     middleware.extend(fallback_mw)
     return middleware or None
@@ -528,7 +532,7 @@ def _build_default_subagent(
         subagent_params["tools"] = resolved_tools
     if skill_paths:
         subagent_params["skills"] = to_virtual_skill_sources(skill_paths)
-    middleware = _subagent_middleware(name, resolved_tools, fallback_mw)
+    middleware = _subagent_middleware(name, resolved_tools, fallback_mw, spec.name)
     if middleware:
         subagent_params["middleware"] = middleware
 
@@ -587,7 +591,7 @@ def _build_compiled_subagent(
         "backend": get_configured_backend(),
     }
 
-    middleware = _subagent_middleware(name, resolved_tools, fallback_mw)
+    middleware = _subagent_middleware(name, resolved_tools, fallback_mw, spec.name)
     if middleware:
         create_kwargs["middleware"] = middleware
 

@@ -42,6 +42,12 @@ apiVersion: http.keda.sh/v1alpha1
 kind: HTTPScaledObject
 metadata:
   name: agent
+  annotations:
+    # Routing table entry only. Without this the add-on creates its
+    # own ScaledObject alongside the metric-based one in
+    # in-flight-scaledobject.yaml, and two scalers argue over the
+    # same Deployment.
+    httpscaledobject.keda.sh/skip-scaledobject-creation: "true"
   labels:
     app: agent
     component: agent

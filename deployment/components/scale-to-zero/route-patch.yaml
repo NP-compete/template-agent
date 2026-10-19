@@ -3,8 +3,12 @@
 # replicas — nothing is listening, and nothing triggers a scale-up.
 #
 # The interceptor accepts the connection, holds it while KEDA scales the
-# Deployment, then forwards. Service name and port are the add-on's
-# defaults; confirm against the operator's install namespace.
+# Deployment, then forwards.
+#
+# Pointed at the local ExternalName Service, not at the interceptor
+# directly: a Route resolves only Services in its own namespace, and
+# the interceptor lives in `keda`, so naming it here left the Route
+# with no backend and a 503.
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
@@ -12,6 +16,6 @@ metadata:
 spec:
   to:
     kind: Service
-    name: keda-add-ons-http-interceptor-proxy
+    name: keda-interceptor-proxy
   port:
     targetPort: 8080

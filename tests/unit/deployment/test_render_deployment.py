@@ -118,7 +118,11 @@ class TestValuesReachTheManifests:
         spec = openshift["HorizontalPodAutoscaler/agent"]["spec"]
         pods = [m for m in spec["metrics"] if m["type"] == "Pods"]
         assert len(pods) == 1
-        assert pods[0]["pods"]["metric"]["name"] == "aegra_runs_in_flight"
+        # The per-pod gauge. A `Pods` metric divides by the replica
+        # count, and the cluster-wide gauge reports the same total
+        # from every replica, so the average never fell as pods were
+        # added and the HPA climbed to maxReplicas and stayed.
+        assert pods[0]["pods"]["metric"]["name"] == "aegra_runs_in_flight_pod"
         assert pods[0]["pods"]["target"]["averageValue"] == str(
             VALUES["autoscaling"]["targetRunsInFlightPerPod"]
         )
