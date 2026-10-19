@@ -21,6 +21,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -613,6 +614,57 @@ def _build_store_backend(fs_config: Any) -> Any:
         return _build_state_backend()
 
 
+# Matches ${VAR} and $VAR, the two forms os.path.expandvars understands.
+_ENV_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+def _resolve_route_root(dir_name: str, fallback_name: str) -> Path:
+    """Resolve a filesystem route's directory to an absolute path.
+
+    A route's directory normally lives inside the agent's config tree and
+    is named relative to it ("/skills/" -> <config>/skills). Uploaded data
+    sits on its own volume, mounted somewhere else entirely, so a root may
+    also be given as an absolute path.
+
+    Environment variables are expanded first, so a config can point at a
+    mount without hardcoding it: "${DATA_PATH}/current" follows DATA_PATH
+    wherever it is set, which keeps the same agent.yaml working in a pod
+    and on a developer's machine.
+
+    Args:
+        dir_name: Route directory from ``backend.roots``, or the route
+            prefix when no override is configured.
+        fallback_name: Config-relative directory to use when *dir_name*
+            references a variable that is unset or empty. Normally the
+            route prefix, which is what an unconfigured route resolves to.
+
+    Returns:
+        Absolute path to use as the backend's root.
+    """
+    referenced = [m.group(1) or m.group(2) for m in _ENV_VAR_RE.finditer(dir_name)]
+    unusable = [var for var in referenced if not os.environ.get(var, "").strip()]
+    if unusable:
+        # Both failure modes land somewhere unrelated to the configured route:
+        # an unset variable survives expansion as a literal "${VAR}" segment,
+        # and an empty one collapses "${VAR}/current" to "/current" -- an
+        # absolute path at the filesystem root. Either way the agent silently
+        # reads an empty directory, so fall back inside the config tree.
+        logger.warning(
+            "Filesystem route root %r references unset or empty %s; "
+            "falling back to the config tree at %r",
+            dir_name,
+            ", ".join(unusable),
+            fallback_name,
+        )
+        fallback: Path = agent_config.base_dir / fallback_name
+        return fallback
+    path = Path(os.path.expandvars(dir_name))
+    if path.is_absolute():
+        return path
+    relative: Path = agent_config.base_dir / path
+    return relative
+
+
 def _build_composite_backend(fs_config: Any) -> Any:
     """Build a CompositeBackend instance with configured routes."""
     from deepagents.backends.composite import CompositeBackend
@@ -621,10 +673,11 @@ def _build_composite_backend(fs_config: Any) -> Any:
     state_backend = StateBackend()
     routes: dict[str, Any] = {}
 
+    roots = getattr(fs_config.backend, "roots", None) or {}
     for path_prefix, backend_name in fs_config.backend.routes.items():
         if backend_name.split(":", 1)[0] == "filesystem_readonly":
             routes[path_prefix] = _build_filesystem_readonly_backend(
-                _readonly_root(path_prefix, backend_name)
+                _readonly_root(path_prefix, backend_name, roots)
             )
 
     if any(v == "local_shell" for v in fs_config.backend.routes.values()):
@@ -682,7 +735,9 @@ def _build_composite_backend(fs_config: Any) -> Any:
     return CompositeBackend(default=default_backend, routes=routes)
 
 
-def _readonly_root(path_prefix: str, backend_name: str) -> Path:
+def _readonly_root(
+    path_prefix: str, backend_name: str, roots: dict[str, str] | None = None
+) -> Path:
     """Where a `filesystem_readonly` route reads from.
 
     `filesystem_readonly` resolves under the config directory, so
@@ -693,14 +748,15 @@ def _readonly_root(path_prefix: str, backend_name: str) -> Path:
     — a gigabyte of Parquet there would make every config read slow.
 
     `filesystem_readonly:/app/data/documents` gives an explicit root
-    instead. Relative paths stay relative to the config directory so
-    the existing form keeps working unchanged.
+    instead. A `backend.roots` entry says the same thing out of
+    line; both arrived separately and both are in use, so the
+    inline form wins where it is given. Either way the path goes
+    through `_resolve_route_root`, which expands environment
+    variables and keeps relative paths under the config directory.
     """
     _, _, explicit = backend_name.partition(":")
-    if not explicit:
-        return agent_config.base_dir / path_prefix.strip("/")
-    root = Path(explicit)
-    return root if root.is_absolute() else agent_config.base_dir / root
+    dir_name = explicit or (roots or {}).get(path_prefix) or path_prefix.strip("/")
+    return _resolve_route_root(dir_name, path_prefix.strip("/"))
 
 
 def _build_filesystem_readonly_backend(root_dir: Path) -> ReadOnlyFilesystemBackend:
@@ -711,7 +767,8 @@ def _build_filesystem_readonly_backend(root_dir: Path) -> ReadOnlyFilesystemBack
 
     Args:
         root_dir: Directory to use as the filesystem root. Derived from
-            the route prefix in agent.yaml (e.g., "/skills/" → base_dir/skills).
+            the route prefix in agent.yaml (e.g., "/skills/" → base_dir/skills),
+            or from an explicit ``backend.roots`` override.
     """
     if not root_dir.is_dir():
         logger.warning(

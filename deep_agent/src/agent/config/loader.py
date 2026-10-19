@@ -732,6 +732,11 @@ class AgentConfig:
         happened to call an accessor first worked, and a caller that
         read the attribute first got AttributeError. That is an
         ordering dependency nobody can see at the call site.
+
+        Returns the directories too, not just the names: resolving a
+        skill to a path needs them, and a second accessor returning
+        only names drifted into this class and then silently shadowed
+        this one, because Python keeps the last definition.
         """
         self._ensure_loaded()
         return self._available_skills

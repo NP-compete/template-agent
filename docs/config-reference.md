@@ -120,6 +120,7 @@ Structure of the ``filesystem:`` section in runtime/agent.yaml.
 | `backend.store.enabled` | bool | `False` |  |
 | `backend.store.scope` | 'user' \| 'assistant' \| 'org' | `'user'` |  |
 | `backend.routes` | map[str] | _(empty)_ |  |
+| `backend.roots` | map[str] | _(empty)_ | Optional per-route directory override, relative to the config base dir. Defaults to the route prefix itself (e.g. "/skills/" → skills). |
 | `permissions` | list[PermissionRule] | _(empty)_ |  |
 | `permission_inheritance` | bool | `False` |  |
 | `settings` | FilesystemSettings | _(section)_ |  |

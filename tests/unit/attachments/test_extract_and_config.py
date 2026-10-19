@@ -228,10 +228,14 @@ class TestUploadBodyLimit:
     def _middleware(self):
         from deep_agent.aegra.security_middleware import RequestSizeLimitMiddleware
 
-        m = RequestSizeLimitMiddleware.__new__(RequestSizeLimitMiddleware)
-        m.max_size_bytes = 10 * 1024 * 1024
-        m.upload_max_bytes = 60 * 1024 * 1024
-        return m
+        # Built, not __new__'d: bypassing __init__ meant a field
+        # added to the constructor was simply missing here, and the
+        # suite failed on an AttributeError rather than on the limit.
+        return RequestSizeLimitMiddleware(
+            app=None,
+            max_size_bytes=10 * 1024 * 1024,
+            upload_max_bytes=60 * 1024 * 1024,
+        )
 
     @pytest.mark.parametrize(
         "path",
@@ -245,22 +249,22 @@ class TestUploadBodyLimit:
         ],
     )
     def test_upload_paths_get_the_larger_limit(self, path):
-        assert self._middleware()._limit_for(path) == 60 * 1024 * 1024
+        assert self._middleware().limit_for(path) == 60 * 1024 * 1024
 
     @pytest.mark.parametrize(
         "path", ["/threads", "/threads/abc/runs", "/search/threads", "/admin/config"]
     )
     def test_everything_else_keeps_the_json_limit(self, path):
-        assert self._middleware()._limit_for(path) == 10 * 1024 * 1024
+        assert self._middleware().limit_for(path) == 10 * 1024 * 1024
 
     def test_the_exemption_is_a_limit_not_an_absence_of_one(self):
         """Uploads are still bounded — just by a different number."""
         m = self._middleware()
-        assert m._limit_for("/threads/x/attachments") < float("inf")
+        assert m.limit_for("/threads/x/attachments") < float("inf")
 
     def test_a_lookalike_path_does_not_get_the_exemption(self):
         """`/attachments-admin` is not an upload path."""
-        assert self._middleware()._limit_for("/attachments-admin") == 10 * 1024 * 1024
+        assert self._middleware().limit_for("/attachments-admin") == 10 * 1024 * 1024
 
 
 class TestMediaInlineLimit:

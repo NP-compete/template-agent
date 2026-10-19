@@ -311,6 +311,16 @@ filesystem:
     store:
       enabled: true
       scope: user
+    # Optional per-route directory override. A relative value is resolved
+    # inside the config tree ("/skills/" -> skills); an absolute one points
+    # elsewhere, and ${VAR} is expanded first.
+    # /data/ lives on its own volume rather than in the config tree, so it
+    # follows DATA_PATH and the same file works in a pod and locally. The
+    # extra "current" level exists because DATA_PATH is a mount point and
+    # cannot be renamed over; it stays invisible to the agent, which sees
+    # /data/<exactly what was uploaded>.
+    roots:
+      "/data/": "${DATA_PATH}/current"
     routes:
       "/skills/": filesystem_readonly
       # Documents on a mounted volume, read-only. An explicit root
@@ -323,6 +333,7 @@ filesystem:
       # tool, so `permissions` below governs them like everything
       # else.
       "/documents/": filesystem_readonly:/app/data/documents
+      "/data/": filesystem_readonly
       "/memories/": store
       "/reports/": store
       "/uploads/": state
@@ -336,6 +347,7 @@ filesystem:
         - "skills/**"
         - "uploads/**"
         - "documents/**"
+        - "data/**"
       mode: allow
     - operations: [write, edit]
       paths: ["reports/**", "memories/**"]
