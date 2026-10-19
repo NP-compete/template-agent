@@ -122,9 +122,15 @@ def _safe_target(root: Path, filename: str) -> Path:
     The name comes from a multipart upload, so it is attacker-chosen:
     `../../app/config/agent/PROMPT.md` would otherwise rewrite the
     agent's instructions through a dataset upload.
+
+    Subdirectories are kept rather than flattened. Reducing the name
+    to its last component meant `PUT /documents/sub/file.csv`
+    answered 200 and wrote `file.csv` in the root, so the caller was
+    told their path existed when it did not. Containment is checked
+    after resolution, which is what actually stops the traversal.
     """
-    candidate = (root / Path(filename).name).resolve()
-    if not candidate.is_relative_to(root.resolve()):
+    candidate = (root / filename).resolve()
+    if not candidate.is_relative_to(root.resolve()) or candidate == root.resolve():
         raise HTTPException(status_code=400, detail="Invalid filename")
     return candidate
 
@@ -193,9 +199,14 @@ async def upload_document(
                 ),
             )
 
+        # Written beside the target and renamed on success. Writing
+        # in place meant an oversize or failed re-upload deleted the
+        # file that was already there: the cleanup below unlinks
+        # `target`, which for a re-upload is the good copy.
+        staging = target.with_name(f".{target.name}.part")
         size = 0
         try:
-            with target.open("wb") as sink:
+            with staging.open("wb") as sink:
                 while chunk := await upload.read(1024 * 1024):
                     size += len(chunk)
                     # Enforced per chunk, so a client that understated
@@ -204,7 +215,7 @@ async def upload_document(
                     # would already have filled the volume.
                     if size > budget:
                         sink.close()
-                        target.unlink(missing_ok=True)
+                        staging.unlink(missing_ok=True)
                         raise HTTPException(
                             status_code=507,
                             detail=(
@@ -214,14 +225,17 @@ async def upload_document(
                         )
                     sink.write(chunk)
         except HTTPException:
+            staging.unlink(missing_ok=True)
             raise
         except OSError as exc:
-            target.unlink(missing_ok=True)
+            staging.unlink(missing_ok=True)
             logger.error("Could not write dataset %s: %s", target, exc)
             raise HTTPException(
                 status_code=500, detail=f"Could not write {target.name}"
             ) from exc
 
+        # Only now does the previous copy go, and atomically.
+        staging.replace(target)
         budget -= size
         written.append({"path": target.name, "bytes": size})
 
@@ -249,11 +263,16 @@ async def read_document(name: str, request: Request) -> dict[str, Any]:
     if target.is_dir():
         raise HTTPException(status_code=400, detail=f"{name} is a directory")
 
-    raw = target.read_bytes()
+    # One byte past the cap, not the whole file: this is bounded by
+    # the documents volume, not by anything sensible, so reading it
+    # all to slice the first megabyte is how a large upload becomes
+    # an out-of-memory kill.
+    with target.open("rb") as handle:
+        raw = handle.read(_MAX_EDITABLE_BYTES + 1)
     truncated = len(raw) > _MAX_EDITABLE_BYTES
     return {
         "path": name,
-        "bytes": len(raw),
+        "bytes": target.stat().st_size,
         # errors="replace" rather than refusing: a CSV with one bad
         # byte should still be readable enough to find the bad byte.
         "content": raw[:_MAX_EDITABLE_BYTES].decode("utf-8", errors="replace"),
@@ -306,6 +325,11 @@ def _resolve_existing(root: Path, name: str) -> Path:
     target = (root / name).resolve()
     if not target.is_relative_to(root.resolve()) or not target.exists():
         raise HTTPException(status_code=404, detail=f"No such document: {name}")
+    # `.` and `` both resolve to the root, which is inside itself and
+    # does exist, so `DELETE /documents/.` passed every check and
+    # `shutil.rmtree` took the whole volume.
+    if target == root.resolve():
+        raise HTTPException(status_code=400, detail="Refusing to act on the root")
     return target
 
 

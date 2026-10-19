@@ -179,7 +179,7 @@ def ensure_frontmatter(text: str, slug: str, description: str) -> str:
         if re.search(rf"^name:\s*{re.escape(slug)}\s*$", front, re.M):
             return text
         front = re.sub(r"^name:.*$", f"name: {slug}", front, count=1, flags=re.M)
-        if "name:" not in front:
+        if re.search(r"^name:", front, re.M) is None:
             front = f"name: {slug}\n{front}"
         return f"---\n{front}\n---\n{body}"
 

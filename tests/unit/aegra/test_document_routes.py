@@ -93,8 +93,16 @@ class TestUpload:
     async def test_a_traversing_filename_cannot_escape(self, volume):
         # The name is attacker-chosen. `../../config/agent/PROMPT.md`
         # would rewrite the agent's instructions via a data upload.
-        await dr.upload_document(None, [_upload("../../../etc/evil.csv", b"x" * 10)])
-        assert (volume / "evil.csv").exists()
+        #
+        # Refused outright now. It used to be reduced to `evil.csv`
+        # and written to the volume, which is safe but answers a
+        # request to escape with a success for a different file.
+        with pytest.raises(HTTPException) as excinfo:
+            await dr.upload_document(
+                None, [_upload("../../../etc/evil.csv", b"x" * 10)]
+            )
+        assert excinfo.value.status_code == 400
+        assert not (volume / "evil.csv").exists()
         assert not (volume.parent.parent / "etc" / "evil.csv").exists()
 
 
@@ -165,9 +173,27 @@ class TestReadAndWrite:
 
     @pytest.mark.asyncio
     async def test_writing_outside_the_volume_is_refused(self, volume):
-        await dr.write_document("../../escape.csv", dr.DocumentBody(content="x"), None)
-        assert (volume / "escape.csv").exists()
+        """400, not a 200 for a different path.
+
+        This used to flatten the name to `escape.csv` and write it on
+        the volume, which reports success for something the caller
+        did not ask for.
+        """
+        with pytest.raises(HTTPException) as excinfo:
+            await dr.write_document(
+                "../../escape.csv", dr.DocumentBody(content="x"), None
+            )
+        assert excinfo.value.status_code == 400
+        assert not (volume / "escape.csv").exists()
         assert not (volume.parent / "escape.csv").exists()
+
+    @pytest.mark.asyncio
+    async def test_deleting_the_root_is_refused(self, volume):
+        """`DELETE /documents/.` resolved to the volume and rmtree'd it."""
+        (volume / "keep.txt").write_bytes(b"data")
+        with pytest.raises(HTTPException):
+            await dr.delete_document(".", None)
+        assert (volume / "keep.txt").exists()
 
 
 class TestAuth:

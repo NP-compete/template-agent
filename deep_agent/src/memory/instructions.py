@@ -71,9 +71,20 @@ def _instructions_path() -> Path:
     """
     config_dir = os.getenv("CONFIG_PATH")
     if config_dir:
-        override = Path(config_dir) / "memory_instructions.md"
-        if override.is_file():
-            return override
+        # Every declared location, preferred first. Only the flat
+        # root path was checked, so an override placed at
+        # `prompts/memory_instructions.md` — the location `paths.py`
+        # actually prefers — was never picked up.
+        try:
+            from deep_agent.src.agent.config.paths import candidates_for
+
+            relatives = candidates_for("memory_instructions")
+        except Exception:
+            relatives = ("memory_instructions.md",)
+        for relative in relatives:
+            override = Path(config_dir) / relative
+            if override.is_file():
+                return override
     return _BUNDLED_INSTRUCTIONS_PATH
 
 

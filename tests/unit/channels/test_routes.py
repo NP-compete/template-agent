@@ -141,8 +141,28 @@ class TestUnknownChannels:
 
 
 class TestListing:
+    def test_listing_consults_auth(self, client):
+        """This router is mounted on the external Route.
+
+        With no check at all it handed anyone a list of every
+        configured channel and its assistant id, which is a map of
+        what to probe next. Auth is off in tests, so the assertion is
+        that the gate is called, not that it refuses here.
+        """
+        from fastapi import HTTPException
+
+        with patch(
+            "deep_agent.aegra.channel_routes.authenticated_user_id",
+            new=AsyncMock(side_effect=HTTPException(status_code=401)),
+        ):
+            assert client.get("/channels/").status_code == 401
+
     def test_listing_exposes_no_secrets_or_identities(self, client):
-        body = client.get("/channels/").json()
+        with patch(
+            "deep_agent.aegra.channel_routes.authenticated_user_id",
+            new=AsyncMock(return_value="someone"),
+        ):
+            body = client.get("/channels/").json()
         rendered = json.dumps(body)
         assert "webhook" in rendered
         assert SECRET not in rendered

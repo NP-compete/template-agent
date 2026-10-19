@@ -121,8 +121,24 @@ async def classify_with_model(
     raw = getattr(response, "content", response)
     answer = (raw if isinstance(raw, str) else str(raw)).strip().lower()
 
-    # Match on containment: small models like to add punctuation or a
-    # leading "Tier:" despite the instruction.
+    # Exact answer first, then whole words, and only then
+    # containment. Containment alone took the first tier whose name
+    # appeared anywhere, so "not fast, use deep" routed to `fast` and
+    # a tier called `pro` matched the reply "pro-max". Small models
+    # do add punctuation and a leading "Tier:", which is what the
+    # last two passes are for.
+    import re as _re
+
+    by_name = {tier.name.lower(): tier for tier in config.tiers}
+    exact = by_name.get(answer)
+    if exact is not None:
+        return RoutingDecision(exact, f"classifier chose {exact.name}", "classifier")
+
+    tokens = set(_re.findall(r"[a-z0-9_.-]+", answer))
+    for tier in config.tiers:
+        if tier.name.lower() in tokens:
+            return RoutingDecision(tier, f"classifier chose {tier.name}", "classifier")
+
     for tier in config.tiers:
         if tier.name.lower() in answer:
             return RoutingDecision(tier, f"classifier chose {tier.name}", "classifier")

@@ -161,11 +161,7 @@ def _expose_users() -> bool:
     try:
         from deep_agent.src.agent.config import agent_config
 
-        raw = (
-            (agent_config.get_raw_section("analytics") or {})
-            if hasattr(agent_config, "get_raw_section")
-            else {}
-        )
+        raw = agent_config.get_analytics_config() or {}
         return bool(raw.get("expose_users", False))
     except Exception:
         # The safe default for a privacy switch is off, including when

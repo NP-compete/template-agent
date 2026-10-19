@@ -89,8 +89,12 @@ def _thinking_budget_for(model_name: str, max_output_tokens: int | None) -> int 
     so Flash was getting a budget while the comment claimed it was
     not. The behaviour was right; the comment was wrong.
     """
+    # Lowercased, like the routing prefix match. `Gemini-2.5-pro`
+    # otherwise matched nothing, got no budget, and returned the
+    # empty reply this function exists to prevent.
     prefixes = settings.thinking_model_prefixes
-    if not any(model_name.startswith(prefix) for prefix in prefixes):
+    lowered = model_name.lower()
+    if not any(lowered.startswith(prefix.lower()) for prefix in prefixes):
         return None
     if not max_output_tokens:
         return None

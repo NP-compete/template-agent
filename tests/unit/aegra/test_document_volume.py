@@ -58,11 +58,32 @@ class TestSafeTarget:
     def test_resolves_a_plain_name(self, tmp_path):
         assert dr._safe_target(tmp_path, "notes.md").parent == tmp_path.resolve()
 
+    def test_keeps_a_subdirectory(self, tmp_path):
+        """`sub/file.csv` means `sub/file.csv`, not `file.csv`.
+
+        Flattening to the basename answered 200 and wrote somewhere
+        else, so the caller believed a path existed that did not.
+        """
+        target = dr._safe_target(tmp_path, "sub/file.csv")
+        assert target == (tmp_path / "sub" / "file.csv").resolve()
+
     @pytest.mark.parametrize("name", ["../escape.txt", "../../etc/passwd"])
-    def test_strips_traversal_to_the_basename(self, tmp_path, name):
-        # Path(name).name drops the traversal, so the file lands on
-        # the volume rather than outside it.
-        assert dr._safe_target(tmp_path, name).parent == tmp_path.resolve()
+    def test_traversal_is_refused_not_rewritten(self, tmp_path, name):
+        """Refused, rather than quietly turned into something else.
+
+        These used to be reduced to their last component and written
+        to the volume, so a request to escape was answered with a
+        success for a different file.
+        """
+        with pytest.raises(HTTPException) as excinfo:
+            dr._safe_target(tmp_path, name)
+        assert excinfo.value.status_code == 400
+
+    @pytest.mark.parametrize("name", [".", "", "./"])
+    def test_the_root_itself_is_refused(self, tmp_path, name):
+        """`DELETE /documents/.` used to resolve to the volume root."""
+        with pytest.raises(HTTPException):
+            dr._safe_target(tmp_path, name)
 
 
 class TestListDocuments:

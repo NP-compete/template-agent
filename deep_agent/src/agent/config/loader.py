@@ -369,6 +369,12 @@ class AgentConfig:
             logger.warning("Invalid extraction config; using built-in parsers")
             self._extraction_config = ExtractionConfig()
 
+        # Privacy switch for /analytics/users. Read here for the same
+        # reason as the two above: its only reader asked for a
+        # `get_raw_section` that does not exist, so `expose_users:
+        # true` could never take effect and the route always 404'd.
+        self._analytics_config: dict[str, Any] = dict(raw.get("analytics") or {})
+
         # Extract the execution axis. Top level, which is where
         # `validate.py` checks it and where agent.yaml writes it —
         # the only reader looked in the PROMPT.md frontmatter instead
@@ -887,6 +893,11 @@ class AgentConfig:
         """Document-extraction engine from agent.yaml."""
         self._ensure_loaded()
         return self._extraction_config
+
+    def get_analytics_config(self) -> dict[str, Any]:
+        """The `analytics:` block from agent.yaml."""
+        self._ensure_loaded()
+        return self._analytics_config
 
     def get_effects_mode(self) -> str:
         """Whether this deployment may actually change anything.

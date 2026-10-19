@@ -51,9 +51,12 @@ def parse_slack(payload: dict[str, Any]) -> InboundMessage | None:
     if event.get("type") not in ("app_mention", "message"):
         return None
 
-    # `bot_id` covers other apps; `subtype: bot_message` covers legacy
-    # posts; comparing against our own `app_id` covers our own replies.
-    if event.get("bot_id") or event.get("subtype") == "bot_message":
+    # `bot_id` covers other apps; any `subtype` at all covers the
+    # rest. Matching only `bot_message` let `message_changed`,
+    # `message_deleted`, `channel_join` and file shares through, and
+    # each one started a run: editing a message re-ran it, and
+    # deleting one ran the tombstone.
+    if event.get("bot_id") or event.get("subtype"):
         return None
 
     text = (event.get("text") or "").strip()

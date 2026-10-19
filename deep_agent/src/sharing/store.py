@@ -177,8 +177,24 @@ def build_snapshot(values: dict[str, Any], title: str) -> dict[str, Any]:
 
     # Named, not included. A reader can see that the conversation was
     # grounded in a document without the document travelling with it.
+    # `files` is a mapping of path to content, but a thread written
+    # by another writer can hold a list of entries instead. Iterating
+    # that yields dicts, and `.rsplit` on a dict is a 500 in place of
+    # a snapshot.
+    raw_files = (values or {}).get("files") or {}
+    if isinstance(raw_files, dict):
+        paths = list(raw_files)
+    elif isinstance(raw_files, list):
+        paths = [
+            str(entry.get("path") or entry.get("name") or "")
+            if isinstance(entry, dict)
+            else str(entry)
+            for entry in raw_files
+        ]
+    else:
+        paths = []
     attachments = sorted(
-        name.rsplit("/", 1)[-1] for name in (values or {}).get("files", {}) or {}
+        path.rsplit("/", 1)[-1] for path in paths if isinstance(path, str) and path
     )
 
     return {

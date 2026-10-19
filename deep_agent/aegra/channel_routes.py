@@ -23,6 +23,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from deep_agent.aegra.auth_helpers import authenticated_user_id
 from deep_agent.src.channels.adapters import AdapterError, InboundMessage, parse
 from deep_agent.src.channels.config import ChannelConfig
 from deep_agent.src.channels.dispatch import (
@@ -36,6 +37,10 @@ from deep_agent.utils.pylogger import get_python_logger
 logger = get_python_logger()
 
 router = APIRouter(prefix="/channels", tags=["channels"])
+
+# Strong references to the ack-then-work tasks; asyncio keeps only
+# weak ones, so an unheld task can be collected mid-run.
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
 def _load_channels() -> dict[str, ChannelConfig]:
@@ -136,6 +141,11 @@ async def receive(name: str, request: Request) -> Response:
         payload: dict[str, Any] = json.loads(body or b"{}")
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Body is not JSON") from None
+    # A signed `[]` or `"x"` parses fine and then has no `.get`, so
+    # the first attribute access raised a 500 on a request that had
+    # already proved it came from the channel.
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body is not a JSON object")
 
     # Slack proves ownership of a new endpoint with this, before any
     # event is ever sent. It is signed, so it is handled after _verify.
@@ -166,13 +176,25 @@ async def receive(name: str, request: Request) -> Response:
 
     # Ack now, work after: Slack retries anything slower than three
     # seconds, and a retry is a second run of the same prompt.
-    asyncio.create_task(_run_and_deliver(message, channel, user_id))
+    #
+    # The reference is held: asyncio keeps only a weak one, so a task
+    # nobody holds can be collected mid-run and the reply never
+    # arrives, intermittently and under load.
+    task = asyncio.create_task(_run_and_deliver(message, channel, user_id))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
     return Response(status_code=status.HTTP_202_ACCEPTED)
 
 
 @router.get("/")
-async def list_channels() -> dict[str, Any]:
-    """Which channels are live. No secrets, no identity maps."""
+async def list_channels(request: Request) -> dict[str, Any]:
+    """Which channels are live. No secrets, no identity maps.
+
+    Authenticated. The router is mounted on the external Route, so
+    this listed every configured channel and its assistant id to
+    anyone who asked, which is a map of what to go and probe.
+    """
+    await authenticated_user_id(request, reject_anonymous=True)
     return {
         "channels": [
             {"name": name, "type": c.type, "assistant_id": c.assistant_id}

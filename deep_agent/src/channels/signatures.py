@@ -90,7 +90,11 @@ def verify_slack(
     digest = hmac.new(secret.encode(), basestring, hashlib.sha256).hexdigest()
     expected = f"v0={digest}"
 
-    if not hmac.compare_digest(expected, signature):
+    # Bytes, not str. `compare_digest` on two strings raises
+    # TypeError when either holds a non-ASCII character, and the
+    # signature arrives in a header an attacker controls, so a
+    # crafted one turned a verification failure into a 500.
+    if not hmac.compare_digest(expected.encode(), signature.encode("utf-8", "replace")):
         return VerificationResult(False, "signature mismatch")
     return VerificationResult(True)
 

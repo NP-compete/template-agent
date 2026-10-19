@@ -80,6 +80,10 @@ async def connection_state(user_id: str) -> tuple[list[str], list[str]]:
     return connected, unconnected
 
 
+# Strong references to the cache-priming tasks.
+_PRIME_TASKS: set[Any] = set()
+
+
 def build_mcp_status_middleware(user_id: str | None = None) -> Any:
     """Middleware announcing which MCP servers are connected."""
     import asyncio
@@ -115,7 +119,11 @@ def build_mcp_status_middleware(user_id: str | None = None) -> Any:
             logger.debug("Could not prime MCP status", exc_info=True)
 
     try:
-        asyncio.get_running_loop().create_task(_prime())
+        # Held: asyncio keeps only a weak reference, so a task
+        # nobody holds can be collected before it fills the cache.
+        _task = asyncio.get_running_loop().create_task(_prime())
+        _PRIME_TASKS.add(_task)
+        _task.add_done_callback(_PRIME_TASKS.discard)
     except RuntimeError:
         # No loop yet: the async path will fill the cache instead.
         pass
