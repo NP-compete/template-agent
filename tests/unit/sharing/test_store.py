@@ -159,3 +159,104 @@ class TestBuildSnapshot:
         # The allowlist: a new middleware key must not publish itself.
         values = {"messages": [], "internal_scratchpad": "secret"}
         assert "internal_scratchpad" not in build_snapshot(values, "T")
+
+
+class _Result:
+    def __init__(self, row):
+        self._row = row
+
+    async def fetchone(self):
+        return self._row
+
+    async def fetchall(self):
+        return [self._row] if self._row else []
+
+
+class _Conn:
+    """Enough of an async psycopg connection to follow the statements."""
+
+    def __init__(self, row=None):
+        self._row = row
+        self.statements: list[str] = []
+        self.commits = 0
+
+    async def execute(self, sql, params=None):
+        self.statements.append(" ".join(str(sql).split()))
+        return _Result(self._row)
+
+    async def commit(self):
+        self.commits += 1
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class TestViewCounting:
+    """A rejected read is not a view.
+
+    `read_share` counted one before the caller had decided whether
+    this reader may see the share at all, so an `authenticated` link
+    answered with 401 still moved the number its owner uses to decide
+    what to revoke.
+    """
+
+    async def _patched(self, monkeypatch, conn):
+        from deep_agent.src.sharing import store
+
+        async def _connect():
+            return conn
+
+        monkeypatch.setattr(store, "_connect", _connect)
+        return store
+
+    def _row(self):
+        return {
+            "share_id": "s1",
+            "thread_id": "t1",
+            "owner_id": "alice",
+            "title": "A chat",
+            "scope": "authenticated",
+            "created_at": datetime.now(UTC),
+            "expires_at": None,
+            "revoked_at": None,
+            "views": 3,
+            "last_viewed_at": None,
+            "snapshot": {"messages": []},
+        }
+
+    async def test_reading_counts_a_view_by_default(self, monkeypatch):
+        conn = _Conn(self._row())
+        store = await self._patched(monkeypatch, conn)
+
+        found = await store.read_share("s1")
+
+        assert found is not None
+        assert any("views = views + 1" in s for s in conn.statements)
+        assert conn.commits == 1
+
+    async def test_record_view_can_be_deferred(self, monkeypatch):
+        conn = _Conn(self._row())
+        store = await self._patched(monkeypatch, conn)
+
+        await store.read_share("s1", record_view=False)
+
+        assert not any("views = views + 1" in s for s in conn.statements)
+        assert conn.commits == 0
+
+    async def test_the_caller_can_count_it_once_allowed(self, monkeypatch):
+        conn = _Conn(self._row())
+        store = await self._patched(monkeypatch, conn)
+
+        await store.record_share_view("s1")
+
+        assert any("views = views + 1" in s for s in conn.statements)
+        assert conn.commits == 1
+
+    async def test_a_missing_share_reads_as_none(self, monkeypatch):
+        conn = _Conn(None)
+        store = await self._patched(monkeypatch, conn)
+
+        assert await store.read_share("nope") is None
