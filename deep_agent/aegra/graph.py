@@ -130,6 +130,9 @@ def _graph_fingerprint(
     resource_uris: list[str] | None = None,
     user_identity: str = "",
     location: str | None = None,
+    effects_mode: str = "",
+    policies: list[str] | None = None,
+    default_decision: str = "",
 ) -> str:
     """Stable fingerprint for graph cache keying.
 
@@ -138,6 +141,11 @@ def _graph_fingerprint(
     closes over a user id and reports which integrations *they* have
     connected. Shared under a key that omitted the user, the second
     person to ask got the first person's connection state.
+
+    The approval settings are in it for the same reason, from the
+    other direction: denials and interrupts are baked into the
+    compiled graph, so switching `execution.effects` to `dry_run` or
+    editing a policy changed nothing until the TTL ran out.
     """
     hitl_flag = (
         f"hitl={int(hitl_enabled)}"
@@ -147,10 +155,15 @@ def _graph_fingerprint(
     model_flag = f"temp={temperature},max_tokens={max_tokens},location={location}"
     mcp_flag = ",".join(sorted(mcp_names or []))
     resources_flag = ",".join(sorted(resource_uris or []))
+    policy_flag = (
+        f"effects={effects_mode}"
+        f",default={default_decision}"
+        f",policies={'|'.join(policies or [])}"
+    )
     raw = (
         f"{model_name}\0{system_prompt}\0{','.join(sorted(tool_names))}"
         f"\0{hitl_flag}\0{model_flag}\0{mcp_flag}\0{resources_flag}"
-        f"\0user={user_identity}"
+        f"\0user={user_identity}\0{policy_flag}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -552,6 +565,12 @@ async def agent(runtime: ServerRuntime) -> Any:
         resource_uris=orchestrator_cfg.get("resources") or None,
         user_identity=str(user_identity or ""),
         location=orch_location,
+        effects_mode=effects_mode,
+        policies=[
+            f"{p.decision}:{','.join(sorted(p.tools))}"
+            for p in (getattr(hitl, "policies", None) or [])
+        ],
+        default_decision=str(getattr(hitl, "default_decision", "")),
     )
     now = time.time()
     graph_ttl = float(agent_config.get_cache_config().graph.ttl)
@@ -608,12 +627,13 @@ async def agent(runtime: ServerRuntime) -> Any:
     from deep_agent.src.attachments.middleware import build_attachment_middleware
 
     try:
-        mount = AttachmentsConfig(
-            **(agent_config.get_raw_section("attachments") or {})
-            if hasattr(agent_config, "get_raw_section")
-            else {}
-        ).mount_path
+        # The same accessor `attachment_routes` stores files through.
+        # This used to read a `get_raw_section` that `AgentConfig` does
+        # not have, so it always fell back to the default and the
+        # notice named a path nothing was written to.
+        mount = agent_config.get_attachments_config().mount_path
     except Exception:
+        logger.debug("Could not read the attachments mount path", exc_info=True)
         mount = AttachmentsConfig().mount_path
     middleware.append(build_attachment_middleware(mount))
 

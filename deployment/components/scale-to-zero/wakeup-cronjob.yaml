@@ -44,9 +44,18 @@ spec:
                 - -c
                 # --max-time must exceed the cold start, or the poke
                 # gives up before the pod it just woke is Ready.
+                # Through the interceptor, with the Route's host.
+                #
+                # `http://agent:5002` is the Deployment's own Service,
+                # which has no endpoints at zero replicas: the request
+                # fails and nothing scales up, so the one job this
+                # CronJob has never happened. The interceptor is what
+                # holds a request and wakes the Deployment, and it
+                # routes on Host.
                 - >-
                   curl -sS --fail --max-time 150
-                  http://agent:5002/health > /dev/null
+                  -H "Host: AGENT_HOST_PLACEHOLDER"
+                  http://keda-interceptor-proxy:8080/health > /dev/null
                   && echo "agent awake"
               securityContext:
                 runAsNonRoot: true

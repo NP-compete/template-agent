@@ -153,7 +153,18 @@ middleware:
         risk: low
         reason: "Internal planning and delegation; no external effect"
 
-      - tools: ["delete_*", "drop_*", "remove_*", "truncate_*"]
+      # Both shapes. An MCP tool arrives as `<prefix>_delete_branch`,
+      # so the leading-anchor patterns alone skipped every prefixed
+      # server — which is all of them.
+      - tools:
+          - "delete_*"
+          - "drop_*"
+          - "remove_*"
+          - "truncate_*"
+          - "*_delete_*"
+          - "*_drop_*"
+          - "*_remove_*"
+          - "*_truncate_*"
         decision: ask
         risk: high
         reason: "Destructive and usually irreversible"
@@ -205,12 +216,16 @@ middleware:
     # Scoped to read calls that cross the network to a provider and
     # fail transiently. Nothing that writes is listed: retrying a write
     # after an ambiguous failure is how one comment becomes three.
+    # Prefixed, because `tool_prefix` in mcp.json sets
+    # `tool_name_prefix=True` and the runtime name the model and this
+    # list both see is `<prefix>_<tool>`. The bare names matched
+    # nothing.
     tools:
-      - semantic_search_tool      # atlan
-      - traverse_lineage_tool     # atlan
-      - get_merge_request_diffs   # gitlab
-      - list_commits              # gitlab
-      - canvas_read_as_svg        # miro
+      - atlan_semantic_search_tool
+      - atlan_traverse_lineage_tool
+      - gitlab_get_merge_request_diffs
+      - gitlab_list_commits
+      - miro_canvas_read_as_svg
   extra: []
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Async Tasks                                                    [YAML-loaded]

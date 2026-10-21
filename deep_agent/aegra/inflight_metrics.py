@@ -87,17 +87,30 @@ def count_pod_active_runs() -> int:
 
 
 async def count_active_runs() -> int:
-    """Runs pending or running right now."""
+    """Runs pending or running right now.
+
+    Runs left behind by a dead pod keep their `pending`/`running`
+    status for ever — `queries.py` calls those `stale` and reports
+    them separately. Counted here they held the gauge above zero, and
+    a cluster that can never read zero never scales to zero. Same age
+    bound, so both agree on what is still in flight.
+    """
+    from datetime import datetime, timedelta, timezone
+
     from aegra_api.core.orm import Run as RunORM
     from aegra_api.core.orm import _get_session_maker
     from sqlalchemy import func, select
 
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.ANALYTICS_STALE_RUN_SECONDS
+    )
     maker = _get_session_maker()
     async with maker() as session:
         result = await session.execute(
             select(func.count())
             .select_from(RunORM)
             .where(RunORM.status.in_(_ACTIVE_STATUSES))
+            .where(RunORM.updated_at >= cutoff)
         )
         return int(result.scalar() or 0)
 

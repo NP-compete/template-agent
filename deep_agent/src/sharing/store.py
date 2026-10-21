@@ -311,12 +311,19 @@ async def list_shares(owner_id: str) -> list[Share]:
     return [_to_share(row) for row in rows]
 
 
-async def read_share(share_id: str) -> tuple[Share, dict[str, Any]] | None:
-    """Fetch a share and its snapshot, recording the view.
+async def read_share(
+    share_id: str, *, record_view: bool = True
+) -> tuple[Share, dict[str, Any]] | None:
+    """Fetch a share and its snapshot, recording the view by default.
 
     The view counter is incremented here rather than by the caller so
     that every path that reads a share is counted — an audit trail
     that depends on remembering to call it is not an audit trail.
+
+    `record_view=False` is for a caller that has still to decide
+    whether this reader may see it at all. An `authenticated` share
+    rejected with 401 counted as a view, which inflated the number
+    owners use to decide what to revoke.
     """
     async with await _connect() as conn:
         await ensure_schema(conn)
@@ -329,18 +336,29 @@ async def read_share(share_id: str) -> tuple[Share, dict[str, Any]] | None:
             return None
 
         share = _to_share(row)
-        if share.active:
-            await conn.execute(
-                """
-                UPDATE thread_share
-                   SET views = views + 1, last_viewed_at = now()
-                 WHERE share_id = %s
-                """,
-                (share_id,),
-            )
-            await conn.commit()
+        if share.active and record_view:
+            await _count_view(conn, share_id)
 
     return share, dict(row.get("snapshot") or {})
+
+
+async def _count_view(conn: Any, share_id: str) -> None:
+    await conn.execute(
+        """
+        UPDATE thread_share
+           SET views = views + 1, last_viewed_at = now()
+         WHERE share_id = %s
+        """,
+        (share_id,),
+    )
+    await conn.commit()
+
+
+async def record_share_view(share_id: str) -> None:
+    """Count one view, after the reader has been allowed through."""
+    async with await _connect() as conn:
+        await ensure_schema(conn)
+        await _count_view(conn, share_id)
 
 
 def _to_share(row: dict[str, Any]) -> Share:

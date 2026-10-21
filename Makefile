@@ -445,7 +445,11 @@ kind-vertex: ## Point the Kind agent at real Vertex AI instead of the mock model
 	@# Secret. It is never interpolated into a command line, where it
 	@# would land in shell history and process listings.
 	@$(KCTL) -n $(KIND_NS) create secret generic google-adc --from-file=application_default_credentials.json="$(ADC_FILE)" --dry-run=client -o yaml | $(KCTL) -n $(KIND_NS) apply -f - >/dev/null
-	@$(KCTL) -n $(KIND_NS) patch deploy/agent --type=json -p '[{"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"google-adc","secret":{"secretName":"google-adc"}}]},{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"google-adc","mountPath":"/var/run/gcp","readOnly":true}]}]' >/dev/null
+	@# A strategic merge, not a JSON patch. `add` on `/volumes` replaces the
+	@# whole array, which dropped the `agent-documents` PVC mount for as long
+	@# as Vertex was active. Merging by the `name` key appends when absent and
+	@# updates when present, so this is also safe to run twice.
+	@$(KCTL) -n $(KIND_NS) patch deploy/agent -p '{"spec":{"template":{"spec":{"volumes":[{"name":"google-adc","secret":{"secretName":"google-adc"}}],"containers":[{"name":"agent","volumeMounts":[{"name":"google-adc","mountPath":"/var/run/gcp","readOnly":true}]}]}}}}' >/dev/null
 	@# Empty strings, not `VAR-`: these come from the ConfigMap through
 	@# envFrom, and `set env VAR-` only drops an explicit container entry.
 	@# An explicit empty value is what actually shadows an envFrom one —
@@ -455,7 +459,9 @@ kind-vertex: ## Point the Kind agent at real Vertex AI instead of the mock model
 	@echo "Agent now using Vertex AI (project: $(GCP_PROJECT_RESOLVED)). Revert with 'make kind-mock'."
 
 kind-mock: ## Point the Kind agent back at the in-cluster mock model
-	@$(KCTL) -n $(KIND_NS) patch deploy/agent --type=json -p '[{"op":"remove","path":"/spec/template/spec/volumes"},{"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts"}]' >/dev/null 2>&1 || true
+	@# Delete the one entry by merge key. Removing the whole array took the
+	@# `agent-documents` mount with it until `apply -k` put it back.
+	@$(KCTL) -n $(KIND_NS) patch deploy/agent -p '{"spec":{"template":{"spec":{"volumes":[{"name":"google-adc","$$patch":"delete"}],"containers":[{"name":"agent","volumeMounts":[{"name":"google-adc","$$patch":"delete"}]}]}}}}' >/dev/null 2>&1 || true
 	@$(KCTL) -n $(KIND_NS) set env deploy/agent \
 		GOOGLE_APPLICATION_CREDENTIALS- GOOGLE_CLOUD_PROJECT- \
 		MODEL_OVERRIDE- VLLM_BASE_URL- >/dev/null
@@ -473,8 +479,11 @@ test-nightly-kind: ## Kill-and-restart tier against the local Kind cluster (make
 	@# The tier asks the stub for a slow response per request (see
 	@# tests/nightly), so running it does not slow the cluster down for
 	@# anyone else using the UI at the time.
+	@# `\$$(` in WORKER_KILL_COMMAND so the pod lookup runs each time the
+	@# command is executed. Left unescaped the shell resolved it once, and the
+	@# second kill in a run targeted a pod that was already gone.
 	@AGENT_URL=http://agent.localhost:$(KIND_HTTP_PORT) \
-	WORKER_KILL_COMMAND="$(KCTL) -n $(KIND_NS) delete $$($(KCTL) -n $(KIND_NS) get pod -l component=agent -o name | head -1) --force --grace-period=0" \
+	WORKER_KILL_COMMAND="$(KCTL) -n $(KIND_NS) delete \$$($(KCTL) -n $(KIND_NS) get pod -l component=agent -o name | head -1) --force --grace-period=0" \
 	.venv/bin/python -m pytest tests/nightly -m nightly -v
 
 test-deployment: ## Render every overlay and assert the OpenShift constraints

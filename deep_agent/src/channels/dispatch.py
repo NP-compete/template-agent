@@ -92,6 +92,19 @@ async def run_for_channel(
     headers: dict[str, str] = {}
     if service_token:
         headers["Authorization"] = f"Bearer {service_token}"
+    elif settings.ENABLE_AUTH:
+        # Said plainly, here. Without the token the loopback call
+        # carries no `Authorization`, `@auth.authenticate` rejects it,
+        # and the channel fails with a 401 from the agent calling
+        # itself — which reads as the agent being broken rather than
+        # as one unset variable. `X-Channel-User-Id` is attribution,
+        # not credentials, and the authenticate callback never reads
+        # it.
+        raise RuntimeError(
+            "CHANNEL_SERVICE_TOKEN is required when ENABLE_AUTH is set: "
+            "the channel run calls the agent over loopback and has no "
+            "other way to authenticate."
+        )
     # The run is attributed to the mapped platform user, not to the
     # channel, so ownership and authz behave as they do for the UI.
     headers["X-Channel-User-Id"] = user_id
@@ -165,22 +178,31 @@ async def _deliver_slack(reply: str, message: InboundMessage) -> None:
         logger.warning("SLACK_BOT_TOKEN unset — cannot post reply")
         return
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        result = await client.post(
-            settings.SLACK_POST_MESSAGE_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "channel": message.metadata.get("channel"),
-                # Reply in-thread, so the agent does not shout into the
-                # channel for every mention.
-                "thread_ts": message.metadata.get("thread_ts"),
-                "text": reply,
-            },
-        )
+    # Delivery is best-effort, and failing it must not fail the run.
+    # `result.json()` sat outside any handler, so a Slack outage or
+    # an HTML error page raised out of here and the run was recorded
+    # as failed even though the agent had produced its answer.
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            result = await client.post(
+                settings.SLACK_POST_MESSAGE_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "channel": message.metadata.get("channel"),
+                    # Reply in-thread, so the agent does not shout into
+                    # the channel for every mention.
+                    "thread_ts": message.metadata.get("thread_ts"),
+                    "text": reply,
+                },
+            )
         # Slack signals failure in the body with HTTP 200.
         body = result.json()
-        if not body.get("ok"):
-            logger.warning("Slack rejected the reply: %s", body.get("error"))
+    except Exception as exc:
+        logger.warning("Could not deliver the reply to Slack: %s", exc)
+        return
+
+    if not body.get("ok"):
+        logger.warning("Slack rejected the reply: %s", body.get("error"))
 
 
 async def _deliver_webhook(reply: str, message: InboundMessage) -> None:
@@ -196,16 +218,27 @@ async def _deliver_webhook(reply: str, message: InboundMessage) -> None:
 
     url = str(message.reply_to)
     try:
-        await asyncio.to_thread(assert_safe_url, url)
+        addresses = await asyncio.to_thread(assert_safe_url, url)
     except UnsafeURLError as exc:
         logger.warning("Refusing callback to %s: %s", url, exc)
         return
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    # Pinned to the address that was checked, exactly as `fetch_url`
+    # does. `assert_safe_url` resolves the name once and httpx would
+    # resolve it again, so a host answering public for the first
+    # lookup and an internal address for the second passed the check
+    # and then received the POST anyway.
+    parsed = httpx.URL(url)
+    hostname = parsed.host
+    pinned = parsed.copy_with(host=addresses[0]) if addresses else parsed
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
         try:
             await client.post(
-                url,
+                pinned,
                 json={"conversation": message.conversation, "text": reply},
+                headers={"Host": hostname},
+                extensions={"sni_hostname": hostname},
             )
         except httpx.HTTPError as exc:
             logger.warning("Callback to %s failed: %s", message.reply_to, exc)

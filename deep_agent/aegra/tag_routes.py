@@ -116,7 +116,11 @@ async def set_tags(
             """
             UPDATE thread
                SET metadata_json = jsonb_set(
-                       metadata_json, '{tags}', %(tags)s::jsonb, true
+                       -- COALESCE, because jsonb_set returns NULL for a
+                       -- NULL target: a thread with no metadata had the
+                       -- column erased instead of being tagged.
+                       COALESCE(metadata_json, '{}'::jsonb),
+                       '{tags}', %(tags)s::jsonb, true
                    ),
                    updated_at = now()
              WHERE thread_id = %(thread_id)s AND user_id = %(user_id)s
@@ -216,7 +220,7 @@ async def threads_by_tag(
                 # every thread the user owns.
                 """
                 SELECT thread_id,
-                       metadata_json ->> 'title' AS title,
+                       metadata_json ->> 'thread_name' AS title,
                        metadata_json -> 'tags'   AS tags,
                        updated_at
                   FROM thread

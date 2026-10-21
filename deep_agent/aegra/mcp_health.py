@@ -150,8 +150,14 @@ async def check_mcp_servers() -> dict[str, Any]:
     try:
         from deep_agent.aegra.mcp import _get_mcp_breaker
 
-        for name in enabled:
-            if _get_mcp_breaker(name).is_open:
+        for name, cfg in enabled.items():
+            # The same key `_connect_single_server` uses. It calls
+            # `_get_mcp_breaker(mcp_server or name)` where `name` is
+            # the `tool_prefix`, so looking the breaker up by the
+            # mcp.json key read a different breaker and a prefixed
+            # server's open circuit was never reported.
+            breaker_key = cfg.get("tool_prefix") or name
+            if _get_mcp_breaker(breaker_key).is_open:
                 open_breakers.add(name)
     except Exception:
         logger.debug("Could not read MCP breaker state", exc_info=True)

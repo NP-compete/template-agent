@@ -285,52 +285,66 @@ def _make_safe_ainvoke(target_tool: Any) -> Any:
         from langchain_core.messages import ToolMessage
         from langgraph.errors import GraphBubbleUp
 
-        try:
-            return await original_ainvoke(tool_input, config, **kwargs)
-        except NeedsAuthorization as exc:
-            nested_without_interrupt = (
-                _in_nested_graph() and not settings.MCP_AUTH_INTERRUPT_IN_SUBAGENTS
-            )
-            # Asked already and not answered: inform, do not block.
-            asked_before = await _already_asked(exc.mcp_name)
+        # Same shape as `wrapped_coroutine` below, and for the same
+        # reason: the cooldown belongs after a declined resume, not
+        # before the pause. Recorded first, the very first ask
+        # disqualified every ask after it, so func-based and
+        # unwrapped tools never paused at all.
+        paused = False
+        while True:
+            try:
+                return await original_ainvoke(tool_input, config, **kwargs)
+            except NeedsAuthorization as exc:
+                nested_without_interrupt = (
+                    _in_nested_graph() and not settings.MCP_AUTH_INTERRUPT_IN_SUBAGENTS
+                )
+                # Asked already and not answered: inform, do not block.
+                asked_before = await _already_asked(exc.mcp_name)
 
-            if nested_without_interrupt or asked_before:
+                if nested_without_interrupt or asked_before or paused:
+                    if paused:
+                        # Came back from the Connect button still
+                        # unconnected: they declined.
+                        await _remember_asked(exc.mcp_name)
+                    logger.info(
+                        "MCP auth required for '%s' — reporting upward (%s)",
+                        exc.mcp_name,
+                        "declined"
+                        if paused
+                        else "already asked this user"
+                        if asked_before
+                        else "inside a subagent",
+                    )
+                    record_auth_request(exc)
+                    return ToolMessage(
+                        content=_mcp_auth_message(exc),
+                        name=getattr(target_tool, "name", "unknown"),
+                        tool_call_id=str(tool_input.get("id", ""))
+                        if isinstance(tool_input, dict)
+                        else "",
+                        status="error",
+                    )
                 logger.info(
-                    "MCP auth required for '%s' — reporting upward (%s)",
+                    "MCP auth required for '%s' — interrupting run",
                     exc.mcp_name,
-                    "already asked this user" if asked_before else "inside a subagent",
                 )
                 record_auth_request(exc)
+                paused = True
+                interrupt(_mcp_auth_interrupt_payload(exc))
+            except GraphBubbleUp:
+                raise
+            except Exception as exc:
+                tool_name = getattr(target_tool, "name", "unknown")
+                tool_call_id = ""
+                if isinstance(tool_input, dict):
+                    tool_call_id = str(tool_input.get("id", ""))
+                logger.warning("MCP tool '%s' failed: %s", tool_name, exc)
                 return ToolMessage(
-                    content=_mcp_auth_message(exc),
-                    name=getattr(target_tool, "name", "unknown"),
-                    tool_call_id=str(tool_input.get("id", ""))
-                    if isinstance(tool_input, dict)
-                    else "",
+                    content=f"[TOOL_ERROR] {tool_name} failed: {exc}",
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
                     status="error",
                 )
-            logger.info(
-                "MCP auth required for '%s' — interrupting run",
-                exc.mcp_name,
-            )
-            record_auth_request(exc)
-            await _remember_asked(exc.mcp_name)
-            interrupt(_mcp_auth_interrupt_payload(exc))
-            return await original_ainvoke(tool_input, config, **kwargs)
-        except GraphBubbleUp:
-            raise
-        except Exception as exc:
-            tool_name = getattr(target_tool, "name", "unknown")
-            tool_call_id = ""
-            if isinstance(tool_input, dict):
-                tool_call_id = str(tool_input.get("id", ""))
-            logger.warning("MCP tool '%s' failed: %s", tool_name, exc)
-            return ToolMessage(
-                content=f"[TOOL_ERROR] {tool_name} failed: {exc}",
-                name=tool_name,
-                tool_call_id=tool_call_id,
-                status="error",
-            )
 
     return safe_ainvoke
 

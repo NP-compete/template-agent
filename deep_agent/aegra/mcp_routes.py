@@ -153,6 +153,9 @@ _ICON_CACHE: dict[str, tuple[bytes, str]] = {}
 # serving an icon.
 _MAX_ICON_BYTES = settings.MCP_MAX_ICON_BYTES
 
+# Hops followed by hand, each one re-validated.
+_MAX_ICON_REDIRECTS = 3
+
 
 @router.get("/mcp/{mcp_name}/icon")
 async def mcp_icon(mcp_name: str, request: Request) -> Response:
@@ -179,20 +182,64 @@ async def mcp_icon(mcp_name: str, request: Request) -> Response:
 
         import httpx
 
+        from deep_agent.src.knowledge.fetch import UnsafeURLError, assert_safe_url
+
         try:
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                # A plain fetch with a browser agent: some CDNs serve
-                # a 403 to anything that does not look like one.
-                response = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code >= 400 or len(response.content) > _MAX_ICON_BYTES:
+            # Redirects are followed by hand, one hop at a time, each
+            # hop checked. `follow_redirects=True` let an icon URL
+            # from config bounce the pod onto an internal HTTP
+            # address, which is the pod's own network reachable from
+            # a config file.
+            body = b""
+            media = "image/x-icon"
+            status = 404
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+                next_url = url
+                for _ in range(_MAX_ICON_REDIRECTS + 1):
+                    assert_safe_url(next_url)
+                    if not next_url.startswith("https://"):
+                        raise HTTPException(status_code=404, detail="Icon unavailable")
+                    # A plain fetch with a browser agent: some CDNs
+                    # serve a 403 to anything that does not look like
+                    # one.
+                    async with client.stream(
+                        "GET", next_url, headers={"User-Agent": "Mozilla/5.0"}
+                    ) as response:
+                        status = response.status_code
+                        if status in (301, 302, 303, 307, 308):
+                            location = response.headers.get("location", "")
+                            if not location:
+                                break
+                            next_url = str(response.url.join(location))
+                            continue
+                        media = response.headers.get(
+                            "content-type", "image/x-icon"
+                        ).split(";")[0]
+                        # Counted as it arrives, so an oversized or
+                        # endless body is dropped rather than
+                        # buffered whole and measured afterwards.
+                        async for chunk in response.aiter_bytes():
+                            body += chunk
+                            if len(body) > _MAX_ICON_BYTES:
+                                raise HTTPException(
+                                    status_code=404, detail="Icon unavailable"
+                                )
+                        break
+                else:
+                    raise HTTPException(status_code=404, detail="Icon unavailable")
+            if status >= 400:
                 raise HTTPException(status_code=404, detail="Icon unavailable")
-            media = response.headers.get("content-type", "image/x-icon").split(";")[0]
             if not media.startswith("image/"):
                 raise HTTPException(status_code=404, detail="Not an image")
-            cached = (response.content, media)
+            cached = (body, media)
             _ICON_CACHE[mcp_name] = cached
         except HTTPException:
             raise
+        except UnsafeURLError as exc:
+            from deep_agent.utils.pylogger import get_python_logger
+
+            get_python_logger().warning("Refusing icon fetch for %s: %s", mcp_name, exc)
+            raise HTTPException(status_code=404, detail="Icon unavailable") from None
         except Exception as exc:
             from deep_agent.utils.pylogger import get_python_logger
 

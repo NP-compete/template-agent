@@ -272,6 +272,8 @@ app.add_middleware(SecurityHeadersMiddleware)
 # Multipart framing (boundary, part headers) sits on top of the archive
 # bytes; 64KB is ample for a handful of parts and keeps the body cap from
 # rejecting an archive that is itself within UPLOAD_MAX_ARCHIVE_BYTES.
+from deep_agent.src.attachments.config import AttachmentsConfig  # noqa: E402
+
 _MULTIPART_OVERHEAD_ALLOWANCE = 64 * 1024
 
 # /upload legitimately carries more than the global cap, but it is never
@@ -285,10 +287,22 @@ _BODY_LIMITS = {"/upload": _UPLOAD_BODY_LIMIT}
 
 # Counts bytes as they stream in, so an oversized body is cut off before
 # the multipart parser ever sees it. Added first so it wraps outermost.
+# One number for both, sized from the attachment caps rather than a
+# multiple of the JSON limit: `/threads/{id}/state` is how an
+# attachment is written, and it is also a route any authenticated
+# client can post plain JSON to.
+_ATTACHMENT_BODY_LIMIT = (
+    int(
+        AttachmentsConfig().max_file_bytes * 4 / 3  # base64
+    )
+    + _MULTIPART_OVERHEAD_ALLOWANCE
+)
+
 app.add_middleware(
     StreamingBodyLimitMiddleware,
     max_size_bytes=settings.REQUEST_BODY_MAX_SIZE,
     path_limits=_BODY_LIMITS,
+    upload_max_bytes=_ATTACHMENT_BODY_LIMIT,
 )
 # Cheap pre-check on the declared Content-Length, so a well-behaved client
 # is rejected before sending anything at all.
@@ -296,6 +310,7 @@ app.add_middleware(
     RequestSizeLimitMiddleware,
     max_size_bytes=settings.REQUEST_BODY_MAX_SIZE,
     path_limits=_BODY_LIMITS,
+    upload_max_bytes=_ATTACHMENT_BODY_LIMIT,
 )
 app.add_middleware(
     AdmissionControlMiddleware, max_concurrent=settings.MAX_CONCURRENT_RUNS

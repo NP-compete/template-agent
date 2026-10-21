@@ -29,6 +29,7 @@ urgent.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from pathlib import Path
@@ -45,6 +46,16 @@ from deep_agent.utils.pylogger import get_python_logger
 logger = get_python_logger()
 
 router = APIRouter(prefix=settings.DOCUMENTS_ROUTE_PREFIX, tags=["documents"])
+
+# One writer at a time.
+#
+# Every write computes its headroom from a `_usage(root)` snapshot.
+# Two concurrent uploads each read the same snapshot, each decide
+# they fit, and together they overfill the volume — which is the one
+# failure this endpoint's whole budget arithmetic exists to prevent.
+# Per-process, so it holds for the single writer OpenShift actually
+# gives this ReadWriteOnce volume.
+_write_lock = asyncio.Lock()
 
 # Matches the PVC in deployment/components/documents-pvc. Kept as a
 # setting rather than read from the filesystem: `statvfs` reports the
@@ -169,6 +180,11 @@ async def upload_document(
     root = _root()
     root.mkdir(parents=True, exist_ok=True)
 
+    async with _write_lock:
+        return await _store_uploads(root, files)
+
+
+async def _store_uploads(root: Path, files: list[UploadFile]) -> dict[str, Any]:
     usage = _usage(root)
     remaining = usage["capacity_bytes"] - usage["used_bytes"]
 
@@ -203,6 +219,10 @@ async def upload_document(
         # in place meant an oversize or failed re-upload deleted the
         # file that was already there: the cleanup below unlinks
         # `target`, which for a re-upload is the good copy.
+        # `sub/new.csv` is a valid name and its directory need not
+        # exist yet; without this both the staging write and the
+        # rename raise and the upload answers 500.
+        target.parent.mkdir(parents=True, exist_ok=True)
         staging = target.with_name(f".{target.name}.part")
         size = 0
         try:
@@ -291,6 +311,11 @@ async def write_document(
     await authenticated_user_id(request, reject_anonymous=True, developer_only=True)
     root = _root()
     root.mkdir(parents=True, exist_ok=True)
+    async with _write_lock:
+        return _write_document(root, name, body)
+
+
+def _write_document(root: Path, name: str, body: DocumentBody) -> dict[str, Any]:
     target = _safe_target(root, name)
     if target.suffix.lower() not in _READABLE_SUFFIXES:
         raise HTTPException(
@@ -317,6 +342,7 @@ async def write_document(
             ),
         )
 
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(incoming)
     return {"path": target.name, "bytes": len(incoming), "usage": _usage(root)}
 

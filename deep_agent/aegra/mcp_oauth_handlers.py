@@ -226,7 +226,12 @@ async def discover_oauth_metadata(
             mcp_name,
             ", ".join(sorted(discovered)),
         )
-    _METADATA_CACHE[mcp_name] = discovered
+    if discovered:
+        # Only a real answer is cached. An empty dict after a
+        # transient network failure stuck for the life of the pod, and
+        # every later Connect for that server answered 400 "does not
+        # publish OAuth metadata" until it restarted.
+        _METADATA_CACHE[mcp_name] = discovered
     return discovered
 
 

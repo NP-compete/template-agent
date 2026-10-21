@@ -14,6 +14,41 @@ from deep_agent.utils.pylogger import get_python_logger
 
 logger = get_python_logger()
 
+# Prefix- and suffix-matched. Kept narrow and explicit rather than a
+# pattern, so adding an exemption is a deliberate edit.
+UPLOAD_PATHS = ("/knowledge/documents", "/knowledge/sources")
+
+# `/state` is how an attachment is actually written: the upload
+# endpoint base64-encodes the file and POSTs it back to the thread
+# over loopback. Without the exemption a 12 MB video uploads fine and
+# then fails on the internal write, surfacing as a 502 that blames
+# storage rather than size.
+#
+# It is the widest of these, and it is on a route every authenticated
+# client can post arbitrary JSON to, so the allowance is sized from
+# the attachment caps rather than left at a round multiple of the
+# JSON limit.
+UPLOAD_SUFFIXES = ("/attachments", "/state")
+
+
+def resolve_body_limit(
+    path: str,
+    *,
+    max_size_bytes: int,
+    upload_max_bytes: int,
+    path_limits: dict[str, int] | None = None,
+) -> int:
+    """The body size limit that applies to *path*.
+
+    One rule, shared by the Content-Length check and the streaming
+    byte count, so the two cannot disagree about a path.
+    """
+    if path_limits and path in path_limits:
+        return path_limits[path]
+    if path.endswith(UPLOAD_SUFFIXES) or path.startswith(UPLOAD_PATHS):
+        return upload_max_bytes
+    return max_size_bytes
+
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add OWASP-recommended security headers to all HTTP responses.
@@ -68,15 +103,8 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     itself reads in chunks and stops at the cap.
     """
 
-    # Prefix- and suffix-matched. Kept narrow and explicit rather
-    # than a pattern, so adding an exemption is a deliberate edit.
-    _UPLOAD_PATHS = ("/knowledge/documents", "/knowledge/sources")
-    # `/state` is how an attachment is actually written: the upload
-    # endpoint base64-encodes the file and POSTs it back to the thread
-    # over loopback. Without the exemption a 12 MB video uploads fine
-    # and then fails on the internal write, surfacing as a 502 that
-    # blames storage rather than size.
-    _UPLOAD_SUFFIXES = ("/attachments", "/state")
+    _UPLOAD_PATHS = UPLOAD_PATHS
+    _UPLOAD_SUFFIXES = UPLOAD_SUFFIXES
 
     def __init__(
         self,
@@ -113,11 +141,12 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 
     def limit_for(self, path: str) -> int:
         """Return the body size limit that applies to a path."""
-        if path in self.path_limits:
-            return self.path_limits[path]
-        if path.endswith(self._UPLOAD_SUFFIXES) or path.startswith(self._UPLOAD_PATHS):
-            return self.upload_max_bytes
-        return self.max_size_bytes
+        return resolve_body_limit(
+            path,
+            max_size_bytes=self.max_size_bytes,
+            upload_max_bytes=self.upload_max_bytes,
+            path_limits=self.path_limits,
+        )
 
     async def dispatch(self, request: Request, call_next: Any) -> Any:
         """Check declared request body size before processing."""
@@ -172,15 +201,28 @@ class StreamingBodyLimitMiddleware:
         app: Any,
         max_size_bytes: int,
         path_limits: dict[str, int] | None = None,
+        upload_max_bytes: int | None = None,
     ):
         """Initialize with a default limit and optional per-path overrides."""
         self.app = app
         self.max_size_bytes = max_size_bytes
         self.path_limits = path_limits or {}
+        self.upload_max_bytes = upload_max_bytes or max_size_bytes
 
     def limit_for(self, path: str) -> int:
-        """Return the body size limit that applies to a path."""
-        return self.path_limits.get(path, self.max_size_bytes)
+        """Return the body size limit that applies to a path.
+
+        The same rule the Content-Length check uses. Two different
+        rules meant a chunked request, which has no Content-Length,
+        was measured against the plain limit while a declared one on
+        the same path got the upload allowance.
+        """
+        return resolve_body_limit(
+            path,
+            max_size_bytes=self.max_size_bytes,
+            upload_max_bytes=self.upload_max_bytes,
+            path_limits=self.path_limits,
+        )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         """Count streamed body bytes and abort the request past the limit."""

@@ -31,7 +31,14 @@ def load_channels() -> ChannelsFileConfig:
     if path is None:
         return ChannelsFileConfig()
 
-    mtime = path.stat().st_mtime
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        # Deleted or replaced between `config_file` and here. Fail
+        # closed, like a malformed file below: a 500 on every channel
+        # request is a worse answer than "no channels".
+        logger.warning("channels.yaml went away while loading — channels disabled")
+        return ChannelsFileConfig()
     if _cache is not None and _cache[0] == mtime:
         return _cache[1]
 

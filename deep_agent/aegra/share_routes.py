@@ -60,7 +60,11 @@ async def share_thread(
     values = (state.json() or {}).get("values") or {}
     title = ""
     if meta.status_code == 200:
-        title = str(((meta.json() or {}).get("metadata") or {}).get("title") or "")
+        # `thread_name` is where a thread's name actually lives (see
+        # `fork_routes`). Reading `title` alone meant every share was
+        # called "Shared conversation".
+        metadata = (meta.json() or {}).get("metadata") or {}
+        title = str(metadata.get("thread_name") or metadata.get("title") or "")
 
     snapshot = store.build_snapshot(values, title or "Shared conversation")
     if not snapshot["messages"]:
@@ -127,7 +131,10 @@ async def my_shares(request: Request) -> dict[str, Any]:
 @router.get("/shared/{share_id}")
 async def read_shared(share_id: str, request: Request) -> dict[str, Any]:
     """Read a shared conversation."""
-    found = await store.read_share(share_id)
+    # Counted after the scope check, not during the lookup. A
+    # request rejected with 401 is not a view, and it was inflating
+    # the figure owners use to decide what to revoke.
+    found = await store.read_share(share_id, record_view=False)
     if found is None:
         raise HTTPException(status_code=404, detail="This link is not valid")
 
@@ -148,6 +155,13 @@ async def read_shared(share_id: str, request: Request) -> dict[str, Any]:
             "This link was revoked" if share.revoked_at else "This link has expired"
         )
         raise HTTPException(status_code=410, detail=detail)
+
+    try:
+        await store.record_share_view(share_id)
+    except Exception:
+        # A counter must not fail a read. Losing a view is a worse
+        # number; a 500 is a broken link.
+        logger.debug("Could not record a view for share %s", share_id, exc_info=True)
 
     return {
         "share_id": share.share_id,

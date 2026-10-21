@@ -59,6 +59,12 @@ spec:
               mountPath: /etc/config
               subPath: ui
               readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           readinessProbe:
             httpGet:
               path: /api/health

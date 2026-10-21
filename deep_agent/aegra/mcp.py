@@ -76,12 +76,27 @@ _cached_tools: OrderedDict[str | None, list[Any]] = OrderedDict()
 _cached_tools_ts: dict[str | None, float] = {}
 _cached_connected_set: dict[str | None, set[str]] = {}
 
+# Bumped every time an entry is dropped.
+#
+# A background refresh captures the value it started with. If a
+# disconnect lands while that refresh is in flight, the tools it is
+# about to write were discovered *before* the disconnect, so writing
+# them back silently undoes the invalidation and the disconnected
+# server keeps working until the TTL runs out.
+_cache_generation: dict[str | None, int] = {}
+
+# Strong references to background refreshes; asyncio keeps only weak
+# ones, so a collected task leaves its key in `_refreshing` for ever
+# and no later refresh for that key can start.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
 
 def _forget_cached_tools(key: str | None) -> None:
     """Drop one cache entry from every structure that tracks it."""
     _cached_tools.pop(key, None)
     _cached_tools_ts.pop(key, None)
     _cached_connected_set.pop(key, None)
+    _cache_generation[key] = _cache_generation.get(key, 0) + 1
     if isinstance(key, str):
         _refreshing.discard(key)
 
@@ -778,13 +793,27 @@ def _create_auth_placeholder_tool(
             f"answer the question. Do not ask the user for anything."
         )
 
+    # Two different jobs, so two different descriptions.
+    #
+    # When the real tools are absent this is the only way in, and the
+    # model has to be told to call it. When they are present it exists
+    # only so a resumed run can answer a call checkpointed against it,
+    # and the "you MUST call this" wording made the model call it once
+    # per relevant turn before touching the tools it already had.
+    description = (
+        f"Deprecated entry point for {svc_desc}. It is already connected: "
+        f"call its tools directly and do not call this."
+        if tools_present
+        else (
+            f"Call this tool to access {svc_desc}. "
+            f"You MUST call this tool when the user asks about any of these "
+            f"services. It will handle authentication automatically."
+        )
+    )
+
     return StructuredTool(
         name=f"mcp__{safe}",
-        description=(
-            f"Call this tool to access {svc_desc}. "
-            f"You MUST call this tool when the user asks about any of these services. "
-            f"It will handle authentication automatically."
-        ),
+        description=description,
         func=lambda query="": "",
         coroutine=_require_auth,
         args_schema=_Input,
@@ -995,6 +1024,8 @@ def invalidate_mcp_tool_cache(user_id: str | None = None) -> None:
         for k in keys:
             _forget_cached_tools(k)
     else:
+        for key in list(_cached_tools):
+            _cache_generation[key] = _cache_generation.get(key, 0) + 1
         _cached_tools.clear()
         _cached_tools_ts.clear()
         _cached_connected_set.clear()
@@ -1083,10 +1114,17 @@ async def get_mcp_tools(
             # fell through to a full rebuild of its own — 27 seconds
             # each, in parallel, to recompute what one background task
             # was already fetching.
+            generation = _cache_generation.get(key, 0)
             try:
                 await get_mcp_tools(
                     sso_token=sso_token, server_names=server_names, user_id=user_id
                 )
+                if _cache_generation.get(key, 0) != generation:
+                    # Disconnected while this was in flight. What the
+                    # refresh just wrote predates the disconnect, and
+                    # keeping it would re-enable a server the user has
+                    # just taken away.
+                    _forget_cached_tools(key)
             except Exception:
                 logger.debug("Background MCP tool refresh failed", exc_info=True)
             finally:
@@ -1099,7 +1137,9 @@ async def get_mcp_tools(
             cache_key,
             len(cached),
         )
-        asyncio.create_task(_revalidate())
+        task = asyncio.create_task(_revalidate())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
         return cached
 
     if cached and len(cached) > 0 and (time.time() - cached_ts) < _MCP_TOOL_CACHE_TTL:

@@ -245,7 +245,10 @@ config:
   # OpenTelemetry Collector, or a vendor agent's OTLP ingest.
   ENABLE_OTEL: "false"
   OTEL_EXPORTER_OTLP_ENDPOINT: ""
-  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  # TLS by default. A remote collector reached over plaintext exports
+  # prompts, tool arguments and user ids in the clear; set this to
+  # "true" only for an in-cluster collector you trust the path to.
+  OTEL_EXPORTER_OTLP_INSECURE: "false"
   OTEL_METRIC_EXPORT_INTERVAL: "60000"
 
   REQUEST_LOGGING_ENABLED: "true"

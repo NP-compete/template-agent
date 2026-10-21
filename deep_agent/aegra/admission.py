@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import weakref
 from typing import Any
 
 from fastapi import Request, status
@@ -101,15 +102,27 @@ class AdmissionControlMiddleware(BaseHTTPMiddleware):
 
         sem = self._sem
 
-        async def _release_when_done() -> Any:
+        def _release_once() -> None:
             nonlocal released
+            if not released:
+                released = True
+                sem.release()
+
+        async def _release_when_done() -> Any:
             try:
                 async for chunk in iterator:
                     yield chunk
             finally:
-                if not released:
-                    released = True
-                    sem.release()
+                _release_once()
 
-        response.body_iterator = _release_when_done()
+        body = _release_when_done()
+        # A net under the `finally` above.
+        #
+        # Starlette sends `http.response.start` before it iterates the
+        # body, so a send error or a client disconnect at that moment
+        # means this generator is collected without a single
+        # `__anext__` and its `finally` never runs. Every such request
+        # took a permit out of circulation for the life of the pod.
+        weakref.finalize(body, _release_once)
+        response.body_iterator = body
         return response

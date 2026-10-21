@@ -155,7 +155,7 @@ async def enter_mcp_session_scope() -> None:
         cache: dict[tuple[str, str], Any] = {}
         _open_sessions.set(cache)
         await _evict_old_session_stacks()
-        _session_stacks[id(cache)] = AsyncExitStack()
+        _session_stacks[id(cache)] = (cache, AsyncExitStack())
 
 
 @asynccontextmanager
@@ -170,14 +170,19 @@ async def mcp_session_scope() -> AsyncIterator[None]:
     token = _open_sessions.set({})
     try:
         async with stack:
-            _session_stacks[id(_open_sessions.get())] = stack
+            scoped = _open_sessions.get()
+            if scoped is not None:
+                _session_stacks[id(scoped)] = (scoped, stack)
             yield
     finally:
         _session_stacks.pop(id(_open_sessions.get() or {}), None)
         _open_sessions.reset(token)
 
 
-_session_stacks: dict[int, AsyncExitStack] = {}
+# The per-turn session cache alongside its stack, so eviction can
+# empty the cache as well as drop the stack. Dropping the stack alone
+# left the cache handing out sessions whose transport was gone.
+_session_stacks: dict[int, tuple[dict[tuple[str, str], Any], AsyncExitStack]] = {}
 
 # How many turn-scoped stacks may be held at once.
 #
@@ -188,14 +193,26 @@ _session_stacks: dict[int, AsyncExitStack] = {}
 # The reuse-within-a-turn trade stands; the unbounded growth was not
 # part of it. Oldest entries are closed first, and a stack still in
 # use by a live turn is within this many turns of being created.
-_MAX_SESSION_STACKS = 32
+#
+# Above `MAX_CONCURRENT_RUNS`, deliberately. At 32 against a limit of
+# 40 concurrent runs the cap was reachable while every stack in it
+# belonged to a turn still running, so eviction closed a session
+# underneath a live answer. The cap is here to stop unbounded growth,
+# not to ration sessions between concurrent turns.
+_MAX_SESSION_STACKS = max(64, settings.MAX_CONCURRENT_RUNS * 2)
 
 
 async def _evict_old_session_stacks() -> None:
     """Close the oldest stacks once there are more than the cap."""
     while len(_session_stacks) >= _MAX_SESSION_STACKS:
-        _, stack = next(iter(_session_stacks.items()))
-        _session_stacks.pop(next(iter(_session_stacks)), None)
+        oldest = next(iter(_session_stacks))
+        cache, stack = _session_stacks.pop(oldest)
+        # Empty the cache first. `aclose()` here runs in whichever
+        # task tripped the cap, not the one that entered the stack,
+        # so anyio raises and the close is only best-effort — but a
+        # cache still holding those sessions would hand a dead one to
+        # the next call in that turn, which is the worse failure.
+        cache.clear()
         try:
             await stack.aclose()
         except Exception:
@@ -232,7 +249,8 @@ async def mcp_session(
         # Inside a scope: hand the session's lifetime to the scope's
         # exit stack so later calls in this turn reuse it and it is
         # still closed exactly once, when the turn ends.
-        stack = _session_stacks.get(id(cache))
+        entry_stack = _session_stacks.get(id(cache))
+        stack = entry_stack[1] if entry_stack is not None else None
         if stack is not None:
             async with asyncio.timeout(timeout):
                 session = await stack.enter_async_context(client.session(mcp_name))

@@ -262,8 +262,11 @@ async def upload_attachments(
 
             data = await _read_bounded(upload, config.max_file_bytes)
 
-            used += len(data)
-            if used > config.max_thread_bytes:
+            # A cheap pre-check, so an obviously oversized upload is
+            # refused before it is extracted or transcribed. Binary is
+            # stored base64, so the number that counts against the
+            # quota is about 4/3 of the bytes on the wire.
+            if used + (len(data) * 4 // 3) > config.max_thread_bytes:
                 raise HTTPException(
                     status_code=413,
                     detail="Thread attachment quota exceeded",
@@ -351,6 +354,19 @@ async def upload_attachments(
                     ),
                     "encoding": "utf-8",
                 }
+
+            # The exact figure, against what was actually written.
+            # `len(data)` undercounted every binary attachment by a
+            # third, so a thread could pass the check and still go
+            # over `max_thread_bytes` in state.
+            used += _size(added[path])
+            if used > config.max_thread_bytes:
+                existing.pop(path, None)
+                added.pop(path, None)
+                raise HTTPException(
+                    status_code=413,
+                    detail="Thread attachment quota exceeded",
+                )
 
             stored.append(
                 {

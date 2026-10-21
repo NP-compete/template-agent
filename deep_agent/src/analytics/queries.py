@@ -184,6 +184,7 @@ class Summary:
     cached_tokens: int = 0
     feedback_up: int = 0
     feedback_down: int = 0
+    timeouts: int = 0
 
     @property
     def success_rate(self) -> float | None:
@@ -192,8 +193,13 @@ class Summary:
         None rather than 0.0 or 100.0: a fresh deployment has no success
         rate, and inventing one puts a green number on a system nobody
         has used.
+
+        `timeout` is terminal and is a failure, so it belongs in the
+        denominator. Counting only successes and errors dropped timed
+        out runs out of the figure entirely and made a deployment that
+        was timing out look more reliable than one that was erroring.
         """
-        finished = self.successes + self.errors
+        finished = self.successes + self.errors + self.timeouts
         return round(self.successes / finished * 100, 1) if finished else None
 
     @property
@@ -252,6 +258,7 @@ async def summary(window: Window) -> Summary:
         COUNT(DISTINCT user_id)                              AS users,
         COUNT(*) FILTER (WHERE status = 'success')           AS successes,
         COUNT(*) FILTER (WHERE status = 'error')             AS errors,
+        COUNT(*) FILTER (WHERE status = 'timeout')           AS timeouts,
         COUNT(*) FILTER (WHERE NOT (status = ANY(%(terminal)s))
                            AND NOT (status = ANY(%(recoverable)s))
                            AND updated_at >= now() - make_interval(
@@ -288,12 +295,20 @@ async def summary(window: Window) -> Summary:
         feedback = (
             await (
                 await conn.execute(
-                    """
+                    f"""
                 SELECT
-                    COUNT(*) FILTER (WHERE feedback = 'up')   AS up,
-                    COUNT(*) FILTER (WHERE feedback = 'down') AS down
-                FROM message_feedback
-                WHERE created_at >= now() - make_interval(days => %(days)s)
+                    COUNT(*) FILTER (WHERE f.feedback = 'up')   AS up,
+                    COUNT(*) FILTER (WHERE f.feedback = 'down') AS down
+                FROM message_feedback f
+                WHERE f.created_at >= now() - make_interval(days => %(days)s)
+                  -- Client traffic only, like every other figure here.
+                  -- Without it satisfaction counted feedback on threads
+                  -- the run numbers beside it exclude.
+                  AND EXISTS (
+                      SELECT 1 FROM runs r
+                       WHERE r.thread_id = f.thread_id
+                         AND {_CLIENT_ONLY_R}
+                  )
                 """,
                     {"days": window.days},
                 )
@@ -309,6 +324,7 @@ async def summary(window: Window) -> Summary:
         users=int(row.get("users") or 0),
         successes=int(row.get("successes") or 0),
         errors=int(row.get("errors") or 0),
+        timeouts=int(row.get("timeouts") or 0),
         in_flight=int(row.get("in_flight") or 0),
         stale=int(row.get("stale") or 0),
         interrupted=int(row.get("interrupted") or 0),

@@ -13,9 +13,10 @@
 #   components:
 #     - ../../components/scale-to-zero
 #
-# Then replace AGENT_HOST_PLACEHOLDER in httpscaledobject.yaml with the
-# Route host, and confirm the interceptor Service name matches your
-# KEDA http-add-on installation.
+# Then replace AGENT_HOST_PLACEHOLDER with the Route host in
+# httpscaledobject.yaml, in-flight-scaledobject.yaml and
+# wakeup-cronjob.yaml, and confirm the interceptor Service name
+# matches your KEDA http-add-on installation.
 #
 # Cluster prerequisites (platform requests, not self-serve):
 #   - Custom Metrics Autoscaler operator (KEDA)
