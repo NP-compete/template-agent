@@ -1605,22 +1605,27 @@ async def upsert_dataset(
         normalized.append((cid, case))
 
     async with _pg_conn() as conn:
-        await conn.execute("DELETE FROM eval_dataset_items")
-        for cid, case in normalized:
-            await conn.execute(
-                "INSERT INTO eval_dataset_items "
-                "(case_id, case_data, judge_model, created_by, updated_by, created_at, updated_at) "
-                "VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s)",
-                (
-                    str(cid),
-                    json.dumps(case),
-                    body.judge_model,
-                    username,
-                    username,
-                    now,
-                    now,
-                ),
-            )
+        # One transaction. The pooled connection is in autocommit, so
+        # the DELETE committed on its own: a failed insert, or a read
+        # arriving mid-loop, saw an empty or half-written dataset.
+        async with conn.transaction():
+            await conn.execute("DELETE FROM eval_dataset_items")
+            for cid, case in normalized:
+                await conn.execute(
+                    "INSERT INTO eval_dataset_items "
+                    "(case_id, case_data, judge_model, created_by, "
+                    "updated_by, created_at, updated_at) "
+                    "VALUES (%s, %s::jsonb, %s, %s, %s, %s, %s)",
+                    (
+                        str(cid),
+                        json.dumps(case),
+                        body.judge_model,
+                        username,
+                        username,
+                        now,
+                        now,
+                    ),
+                )
 
     log.info(
         "Dataset upserted: cases=%d judge_model=%s user=%s",

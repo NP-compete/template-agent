@@ -262,6 +262,16 @@ def _no_real_datastores(request, monkeypatch):
     monkeypatch.setenv("POSTGRES_HOST", "127.0.0.1")
     monkeypatch.setenv("POSTGRES_PORT", "1")
 
+    # The settings singleton is built at import time, so setting the
+    # environment above does nothing for a module that already read
+    # it — the shared pool kept the real database URI and this
+    # fixture only looked like it was isolating the test.
+    from deep_agent.src.settings import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setattr(app_settings, "POSTGRES_PORT", 1)
+    monkeypatch.setattr(app_settings, "REDIS_URL", "redis://127.0.0.1:1/0")
+
     import deep_agent.aegra.redis as redis_mod
 
     monkeypatch.setattr(redis_mod, "REDIS_URL", "redis://127.0.0.1:1/0")

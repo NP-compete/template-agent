@@ -205,9 +205,20 @@ class TestMiddlewareConstruction:
         assert build_model_router_middleware(cfg(enabled=False)) is None
 
     def test_single_tier_builds_nothing(self):
+        """Enabled, with one tier. There is nothing to route between.
+
+        This was written with `enabled=False`, which made it a second
+        copy of the test above: it passed with the `len(tiers) < 2`
+        guard deleted, which is the only thing it is here to check.
+        """
         config = RouterConfig(
             enabled=False, tiers=[{"name": "a", "model": "m", "criteria": "c"}]
         )
+        # Past the model validator, which refuses this combination
+        # outright. The builder's own guard is still the thing under
+        # test: config can also arrive from a cached or hand-built
+        # object that never went through validation.
+        object.__setattr__(config, "enabled", True)
         assert build_model_router_middleware(config) is None
 
     def test_enabled_config_builds_middleware(self):

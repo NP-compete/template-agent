@@ -144,8 +144,11 @@ class TestOfferConnect:
     def test_stamps_nothing_on_a_normal_answer(self):
         from deep_agent.src.self_knowledge.middleware import _offer_connect
 
+        # With an `asked_for` that names the server. Left at its
+        # default `""` nothing could ever match, so this passed
+        # whatever the answer said.
         response, message = self._response("Your manager is Jane Roe.")
-        _offer_connect(response, ("warehouse",))
+        _offer_connect(response, ("warehouse",), "use warehouse to find my manager")
 
         assert "auth_required" not in message.additional_kwargs
 

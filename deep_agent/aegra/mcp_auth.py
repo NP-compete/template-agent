@@ -155,7 +155,17 @@ class McpCredentialResolver:
 
         cache_key = (user_id, mcp_name)
         cached = self._cache.get(cache_key)
-        if cached and (time.time() - cached[1]) < _RESOLVED_TOKEN_TTL_SECONDS:
+        # A caller asking for a renewal buffer is asking for a token
+        # that will still be valid in N seconds, and this cache
+        # cannot answer that: it holds whatever was resolved up to
+        # `_RESOLVED_TOKEN_TTL_SECONDS` ago. Answering from it handed
+        # back a token that expired mid-turn, which is the one thing
+        # the buffer exists to prevent.
+        if (
+            cached
+            and not renew_buffer_seconds
+            and (time.time() - cached[1]) < _RESOLVED_TOKEN_TTL_SECONDS
+        ):
             return cached[0]
 
         token = await self._resolve_oauth(
@@ -373,7 +383,7 @@ class McpCredentialResolver:
                     mcp_name,
                 )
                 raise NeedsAuthorization(mcp_name, self.connect_url(mcp_name))
-            if self._token_valid(stored):
+            if self._token_valid(stored, renew_buffer_seconds):
                 return stored.access_token
             if not stored.refresh_token:
                 logger.info(

@@ -109,7 +109,10 @@ class TestRouteGating:
         # parsing correctly is not a privacy switch.
         from deep_agent.aegra.analytics_routes import _expose_users
 
-        assert _expose_users() in (True, False)
+        # The actual default, against the shipped config. `in (True,
+        # False)` is true of every boolean, so it passed just as
+        # happily with disclosure turned on.
+        assert _expose_users() is False
 
     def test_an_unreadable_config_disables_disclosure(self, monkeypatch):
         import deep_agent.aegra.analytics_routes as routes
@@ -143,17 +146,24 @@ class TestStaleRunsAreNotInFlight:
         assert queries._STALE_AFTER_SECONDS == 3600
 
     def test_the_query_bounds_in_flight_by_age(self):
+        """The bound has to be in the `in_flight` clause itself.
+
+        Searching the whole module found `stale_after` in the `stale`
+        clause and in the comments around it, so the test passed with
+        the age bound deleted from `in_flight` — the one place it
+        matters.
+        """
+        import inspect
+
         from deep_agent.src.analytics import queries
 
-        sql = queries._SUMMARY_SQL if hasattr(queries, "_SUMMARY_SQL") else ""
-        if not sql:
-            import inspect
-
-            sql = inspect.getsource(queries)
-        # in_flight must carry an age bound, or an orphan counts
-        # forever.
-        assert "stale_after" in sql
-        assert "AS stale" in sql
+        source = inspect.getsource(queries)
+        end = source.find("AS in_flight")
+        assert end != -1, "no in_flight column found"
+        start = source.rfind("COUNT(*) FILTER", 0, end)
+        assert start != -1, "no in_flight FILTER clause found"
+        clause = source[start:end]
+        assert "stale_after" in clause
 
     def test_summary_reports_stale_separately(self):
         from deep_agent.src.analytics.queries import Summary

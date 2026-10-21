@@ -94,7 +94,22 @@ def main() -> int:
         return 1
 
     profiles = profiles[:MAX_DATASETS]
-    references = {reference_filename(p.name): profile_to_markdown(p) for p in profiles}
+    # Deduplicated, because `reference_filename` drops the extension:
+    # `sales.csv` and `sales.parquet` both map to `sales.md`, the dict
+    # kept whichever came last, and the other dataset's reference
+    # vanished with no warning.
+    references: dict[str, str] = {}
+    for profile in profiles:
+        name = reference_filename(profile.name)
+        if name in references:
+            stem, _, ext = name.rpartition(".")
+            suffix = slugify(profile.name.rsplit(".", 1)[-1])
+            name = f"{stem}-{suffix}.{ext}"
+            counter = 2
+            while name in references:
+                name = f"{stem}-{suffix}-{counter}.{ext}"
+                counter += 1
+        references[name] = profile_to_markdown(profile)
     joins = find_join_keys(profiles)
     if joins:
         print(f"  shared column names: {', '.join(n for n, _ in joins)}")

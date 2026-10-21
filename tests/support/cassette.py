@@ -153,9 +153,18 @@ class CassetteTransport(httpx.AsyncBaseTransport):
                     f"  re-record with: CASSETTE_MODE=record pytest <test>\n"
                     f"  (replay never falls through to the network)"
                 )
+            # `content-encoding` is dropped on the way out. The body
+            # recorded is `response.text`, already decoded, so
+            # replaying it under a `content-encoding: gzip` header
+            # makes httpx try to gunzip plain text and fail.
+            headers = {
+                k: v
+                for k, v in (entry.get("headers") or {}).items()
+                if k.lower() not in ("content-encoding", "content-length")
+            }
             return httpx.Response(
                 status_code=entry["status"],
-                headers=entry.get("headers") or {},
+                headers=headers,
                 content=entry["body"].encode(),
                 request=request,
             )

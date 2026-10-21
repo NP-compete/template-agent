@@ -172,23 +172,48 @@ def profile_bytes(filename: str, data: bytes) -> DatasetProfile | None:
     suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
     try:
+        # One row past the sample, everywhere it can be done. The
+        # profile only ever looks at `SAMPLE_ROWS`, and the extra row
+        # is what `truncated` is read from — so parsing the whole file
+        # first and slicing afterwards spent the memory of the entire
+        # dataset to describe the top of it.
         if suffix in ("csv", "tsv"):
+            import pyarrow as pa
             from pyarrow import csv as pacsv
 
             delimiter = "\t" if suffix == "tsv" else ","
             # strings_can_be_null: otherwise a blank cell reads as ""
             # and appears in the vocabulary as a real value, while the
             # null rate reports 0% for a column that is a third empty.
-            table = pacsv.read_csv(
+            reader = pacsv.open_csv(
                 io.BytesIO(data),
                 parse_options=pacsv.ParseOptions(delimiter=delimiter),
                 convert_options=pacsv.ConvertOptions(strings_can_be_null=True),
             )
+            batches = []
+            rows = 0
+            for batch in reader:
+                batches.append(batch)
+                rows += batch.num_rows
+                if rows > SAMPLE_ROWS:
+                    break
+            table = pa.Table.from_batches(batches, schema=reader.schema)
         elif suffix == "parquet":
+            import pyarrow as pa
             import pyarrow.parquet as pq
 
-            table = pq.read_table(io.BytesIO(data))
+            parquet_file = pq.ParquetFile(io.BytesIO(data))
+            batches = []
+            rows = 0
+            for batch in parquet_file.iter_batches(batch_size=SAMPLE_ROWS + 1):
+                batches.append(batch)
+                rows += batch.num_rows
+                if rows > SAMPLE_ROWS:
+                    break
+            table = pa.Table.from_batches(batches, schema=parquet_file.schema_arrow)
         elif suffix in ("json", "jsonl", "ndjson"):
+            # pyarrow has no incremental JSON reader, so this one is
+            # still parsed whole. The upload caps are what bound it.
             from pyarrow import json as pajson
 
             table = pajson.read_json(io.BytesIO(data))

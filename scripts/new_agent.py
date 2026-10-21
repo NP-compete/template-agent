@@ -15,6 +15,7 @@ the demo content.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -69,9 +70,16 @@ def _replace_agent_name(text: str, name: str) -> str:
     # to replace and every new agent was born called after the
     # template, which is exactly what `make validate-config` warns
     # about.
+    # A callable replacement and a JSON-quoted value. Interpolated
+    # into the pattern string, a backslash in the name is read as a
+    # group reference (or raises `re.error`), and a double quote
+    # produces YAML that will not parse. JSON string syntax is a
+    # subset of YAML's double-quoted scalar, so quoting it this way
+    # is both safe and valid.
+    replacement = f"name: {json.dumps(name)}"
     return re.sub(
         r"^name:.*$",
-        f'name: "{name}"',
+        lambda _match: replacement,
         text,
         count=1,
         flags=re.MULTILINE,

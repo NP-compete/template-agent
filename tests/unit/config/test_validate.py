@@ -103,7 +103,13 @@ class TestCleanFork:
         (config_copy / "PROMPT.md").write_text(
             "---\nname: orchestrator\ndescription: Handles invoices.\n---\n"
         )
-        (config_copy / "mcp.json").write_text('{"mcpServers": {}}')
+        # Under `integrations/`, where the shipped config keeps it.
+        # Written at the root it was the *legacy* path: the shipped
+        # `integrations/mcp.json` stayed in place and the test only
+        # passed because `_check_legacy_paths` is skipped outside the
+        # repo root.
+        (config_copy / "integrations").mkdir(exist_ok=True)
+        (config_copy / "integrations" / "mcp.json").write_text('{"mcpServers": {}}')
         shutil.rmtree(config_copy / "skills")
         (config_copy / "skills").mkdir()
 

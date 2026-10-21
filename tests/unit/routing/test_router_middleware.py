@@ -95,21 +95,23 @@ async def _run_route(cfg: RouterConfig, request, decision: RoutingDecision, mode
         captured["fn"] = fn
         return MagicMock()
 
+    # Returned, so a caller can assert on the mock that was actually
+    # installed. An outer `patch` of `choose_tier` is replaced by this
+    # one, so a side effect set out there can never fire.
+    chooser = AsyncMock(return_value=decision)
+
     with (
         patch("langchain.agents.middleware.wrap_model_call", _wrap),
         patch(
             "deep_agent.src.agent.llm.create_model",
             MagicMock(return_value=model if model is not None else MagicMock()),
         ),
-        patch(
-            "deep_agent.src.routing.middleware.choose_tier",
-            new=AsyncMock(return_value=decision),
-        ),
+        patch("deep_agent.src.routing.middleware.choose_tier", new=chooser),
     ):
         build_model_router_middleware(cfg)
         handler = AsyncMock(return_value="answered")
         result = await captured["fn"](request, handler)
-    return result, handler
+    return result, handler, chooser
 
 
 def _request(messages, state=None):
@@ -127,7 +129,7 @@ class TestRoute:
         decision = RoutingDecision(
             tier=STRONG, reason="looks hard", method="classifier"
         )
-        result, handler = await _run_route(_config(), request, decision)
+        result, handler, _ = await _run_route(_config(), request, decision)
 
         assert result == "answered"
         request.override.assert_called_once()
@@ -138,14 +140,14 @@ class TestRoute:
         request = _request(
             [{"type": "human", "content": "anything"}], state={STATE_KEY: "cheap"}
         )
-        # choose_tier must not be consulted at all; asserting via a
-        # decision that would pick the other tier if it were.
+        # choose_tier must not be consulted at all. Asserted on the
+        # mock `_run_route` installs: an outer patch here is replaced
+        # by that one, so its side effect could never fire and this
+        # test could not fail.
         decision = RoutingDecision(tier=STRONG, reason="unused", method="classifier")
-        with patch(
-            "deep_agent.src.routing.middleware.choose_tier",
-            new=AsyncMock(side_effect=AssertionError("should not re-route")),
-        ):
-            await _run_route(_config(), request, decision)
+        _, _, chooser = await _run_route(_config(), request, decision)
+
+        chooser.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_every_turn_strategy_re_routes_despite_a_remembered_tier(self):
@@ -154,7 +156,7 @@ class TestRoute:
             state={STATE_KEY: "cheap"},
         )
         decision = RoutingDecision(tier=STRONG, reason="escalated", method="classifier")
-        await _run_route(_config(strategy="every_turn"), request, decision)
+        _, _, _ = await _run_route(_config(strategy="every_turn"), request, decision)
         request.override.assert_called_once()
 
     @pytest.mark.asyncio
@@ -193,7 +195,7 @@ class TestRoute:
         request = _request([{"type": "human", "content": "hi"}])
         ghost = ModelTier(name="ghost", model="nope", criteria="x")
         decision = RoutingDecision(tier=ghost, reason="?", method="classifier")
-        result, handler = await _run_route(_config(), request, decision)
+        result, handler, _ = await _run_route(_config(), request, decision)
 
         assert result == "answered"
         handler.assert_awaited_once_with(request)
@@ -246,5 +248,5 @@ class TestRoutingIsRecorded:
         # here would trade the answer for the footnote.
         request = _request([{"type": "human", "content": "hi"}])
         decision = RoutingDecision(tier=STRONG, reason="hard", method="rule")
-        result, _ = await _run_route(_config(), request, decision)
+        result, _, _ = await _run_route(_config(), request, decision)
         assert result == "answered"

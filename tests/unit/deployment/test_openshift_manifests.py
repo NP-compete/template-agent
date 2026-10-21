@@ -356,9 +356,25 @@ class TestSecrets:
         cluster, never from the repo."""
         import base64
 
+        # Both fields. The rendered `agent-secrets` carries
+        # `stringData` and no `data` at all, so a loop over `data`
+        # alone never ran and this passed whatever was in the repo.
         for secret in of_kind(openshift, "Secret"):
-            for key, value in (secret.get("data") or {}).items():
-                decoded = base64.b64decode(value).decode(errors="replace")
+            values = {
+                key: base64.b64decode(value).decode(errors="replace")
+                for key, value in (secret.get("data") or {}).items()
+            }
+            values.update(
+                {
+                    key: str(value)
+                    for key, value in (secret.get("stringData") or {}).items()
+                }
+            )
+            assert values, (
+                f"Secret/{secret['metadata']['name']} has neither data nor "
+                "stringData — nothing was checked"
+            )
+            for key, decoded in values.items():
                 assert len(decoded) < 200, (
                     f"Secret/{secret['metadata']['name']}.{key} looks like a "
                     "real credential rather than a placeholder"

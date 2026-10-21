@@ -70,6 +70,30 @@ def client() -> httpx.Client:
         yield c
 
 
+def _kill_the_worker(kill_command: str) -> None:
+    """Run the operator's kill command, and insist that it worked.
+
+    `os.system`'s exit status was discarded, so a kill that failed —
+    a wrong label, no permission — let the run finish normally and
+    the test passed with no recovery exercised at all.
+    """
+    status = os.system(kill_command)  # noqa: S605 — operator-supplied, nightly only
+    assert status == 0, f"kill command failed (exit {status}): {kill_command}"
+
+
+def _wait_for_a_live_worker(client: httpx.Client, timeout: float = 180) -> None:
+    """Poll until a replacement pod answers."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if client.get("/health").status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(5)
+    raise AssertionError("no worker came back after the kill")
+
+
 def _create_thread(client: httpx.Client) -> str:
     response = client.post("/threads", json={})
     response.raise_for_status()
@@ -127,7 +151,7 @@ class TestLeaseRecovery:
             "is genuinely in flight."
         )
 
-        os.system(kill_command)  # noqa: S605 — operator-supplied, nightly only
+        _kill_the_worker(kill_command)
 
         # The kill takes endpoints out of the Service; a connection error
         # here is the pod dying, not the run failing. Keep polling.
@@ -152,6 +176,13 @@ class TestLeaseRecovery:
 
     def test_thread_state_survives_a_restart(self, client: httpx.Client):
         """Checkpoints are in Postgres, so state must outlive the process."""
+        kill_command = os.getenv("WORKER_KILL_COMMAND")
+        if not kill_command:
+            pytest.skip(
+                "set WORKER_KILL_COMMAND to the command that kills a worker, "
+                "e.g. 'oc delete pod -l component=agent --force'"
+            )
+
         thread_id = _create_thread(client)
 
         client.post(
@@ -161,6 +192,13 @@ class TestLeaseRecovery:
                 "input": {"messages": [{"type": "human", "content": "remember: 42"}]},
             },
         ).raise_for_status()
+
+        # Restart before reading, or this asserts nothing: an
+        # in-memory checkpointer answers `/history` perfectly well
+        # for as long as the process that wrote it is alive, which
+        # is exactly the case the test is meant to rule out.
+        _kill_the_worker(kill_command)
+        _wait_for_a_live_worker(client)
 
         history = client.get(f"/threads/{thread_id}/history")
         history.raise_for_status()

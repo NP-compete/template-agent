@@ -23,7 +23,9 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg
+from psycopg.rows import tuple_row
 
+from deep_agent.src.db.pool import connection
 from deep_agent.src.settings import settings
 from deep_agent.utils.pylogger import get_python_logger
 
@@ -195,7 +197,12 @@ def derive_title(body: str) -> str:
 async def refresh_user(user_id: str) -> int:
     """Bring this user's index entries up to date. Returns rows written."""
     written = 0
-    async with await psycopg.AsyncConnection.connect(settings.database_uri) as conn:
+    # Through the shared pool. A raw connection per search request
+    # opened a Postgres backend outside the pool budget this PR adds,
+    # which is the budget that stops a burst of searches exhausting
+    # `max_connections`. `tuple_row` because these rows are read
+    # positionally.
+    async with connection(row_factory=tuple_row) as conn:
         await ensure_schema(conn)
         stale = await _stale_threads(conn, user_id)
 
@@ -237,7 +244,12 @@ async def search(
     if not query.strip():
         return []
 
-    async with await psycopg.AsyncConnection.connect(settings.database_uri) as conn:
+    # Through the shared pool. A raw connection per search request
+    # opened a Postgres backend outside the pool budget this PR adds,
+    # which is the budget that stops a burst of searches exhausting
+    # `max_connections`. `tuple_row` because these rows are read
+    # positionally.
+    async with connection(row_factory=tuple_row) as conn:
         await ensure_schema(conn)
         rows = await conn.execute(
             """

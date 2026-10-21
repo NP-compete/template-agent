@@ -129,7 +129,7 @@ class TestSessionStacksAreBounded:
         mh._session_stacks.clear()
         try:
             for i in range(mh._MAX_SESSION_STACKS * 2):
-                mh._session_stacks[i] = AsyncExitStack()
+                mh._session_stacks[i] = ({}, AsyncExitStack())
                 await mh._evict_old_session_stacks()
             assert len(mh._session_stacks) < mh._MAX_SESSION_STACKS
         finally:
@@ -151,12 +151,45 @@ class TestSessionStacksAreBounded:
         mh._session_stacks.clear()
         try:
             for i in range(mh._MAX_SESSION_STACKS + 2):
-                mh._session_stacks[i] = _Tracked()
+                mh._session_stacks[i] = ({}, _Tracked())
                 await mh._evict_old_session_stacks()
             assert closed, "an evicted stack must be closed, not just dropped"
         finally:
             mh._session_stacks.clear()
             mh._session_stacks.update(original)
+
+    async def test_eviction_empties_the_cache_it_drops(self):
+        """A dropped stack must not leave its sessions reachable.
+
+        `aclose()` here runs in whichever task tripped the cap, not
+        the one that entered the stack, so anyio raises and the close
+        is best-effort. A cache still holding those sessions would
+        hand a dead one to the next call in that turn.
+        """
+        from contextlib import AsyncExitStack
+
+        from deep_agent.aegra import mcp_host as mh
+
+        original = dict(mh._session_stacks)
+        mh._session_stacks.clear()
+        caches = []
+        try:
+            for i in range(mh._MAX_SESSION_STACKS + 2):
+                cache = {("server", "user"): object()}
+                caches.append(cache)
+                mh._session_stacks[i] = (cache, AsyncExitStack())
+                await mh._evict_old_session_stacks()
+            assert caches[0] == {}
+        finally:
+            mh._session_stacks.clear()
+            mh._session_stacks.update(original)
+
+    async def test_the_cap_clears_concurrent_runs(self):
+        """At 32 against 40 concurrent runs, eviction hit live turns."""
+        from deep_agent.aegra import mcp_host as mh
+        from deep_agent.src.settings import settings
+
+        assert mh._MAX_SESSION_STACKS > settings.MAX_CONCURRENT_RUNS
 
     async def test_a_failing_close_does_not_stop_eviction(self):
         """A stack whose task is gone raises; the entry must still go."""
@@ -172,7 +205,7 @@ class TestSessionStacksAreBounded:
         mh._session_stacks.clear()
         try:
             for i in range(mh._MAX_SESSION_STACKS + 3):
-                mh._session_stacks[i] = _Angry()
+                mh._session_stacks[i] = ({}, _Angry())
                 await mh._evict_old_session_stacks()
             assert len(mh._session_stacks) < mh._MAX_SESSION_STACKS
         finally:

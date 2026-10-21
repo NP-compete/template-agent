@@ -65,7 +65,20 @@ def install(monkeypatch: Any, clock: FakeClock, *modules: str) -> None:
     binds a reference patching `time.time` will not reach.
     """
     import asyncio
+    import asyncio.base_events
     import importlib
+
+    # The event loop takes its own clock from `time.monotonic()`
+    # (`BaseEventLoop.time`), so freezing that globally stops every
+    # real timer — `asyncio.wait_for`, `call_later` — from ever
+    # firing, and a test that uses one hangs rather than fails. Pin
+    # the loop to the real clock before the fake goes in.
+    real_monotonic = _time.monotonic
+    monkeypatch.setattr(
+        asyncio.base_events.BaseEventLoop,
+        "time",
+        lambda self: real_monotonic(),
+    )
 
     monkeypatch.setattr(_time, "time", clock.time)
     monkeypatch.setattr(_time, "monotonic", clock.monotonic)

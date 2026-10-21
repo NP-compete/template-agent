@@ -69,6 +69,20 @@ def _pydantic_location(error: dict[str, Any]) -> str:
     return ".".join(parts) if parts else "(root)"
 
 
+def _first_present(config_dir: Path, name: str) -> str | None:
+    """The accepted relative path for *name* that exists, preferred first."""
+    from deep_agent.src.agent.config.paths import candidates_for
+
+    try:
+        options = candidates_for(name)
+    except KeyError:
+        return None
+    for relative in options:
+        if (config_dir / relative).is_file():
+            return relative
+    return None
+
+
 def _validate_model(
     report: Report, path: Path, rel: str, model: type[BaseModel], section: str | None
 ) -> BaseModel | None:
@@ -187,22 +201,30 @@ def validate_config(config_dir: Path) -> Report:
         report.add(str(config_dir), "", "Config directory does not exist")
         return report
 
-    # (relative path, model, section within the file)
+    # (config name, model, section within the file)
+    #
+    # By name, not by path. The preferred layout was hardcoded here,
+    # so a fork still on the flat layout — `agent.yaml` at the root,
+    # which `paths.py` accepts and the loader reads — had every one
+    # of these quietly skipped and got no field validation at all.
     targets: list[tuple[str, type[BaseModel], str | None]] = [
         # agent.yaml's `middleware:` block is the *defaults* shape;
         # MiddlewareFileConfig describes a separate defaults/profiles file.
-        ("runtime/agent.yaml", MiddlewareDefaults, "middleware"),
-        ("runtime/agent.yaml", ProvidersFileConfig, "providers"),
-        ("runtime/agent.yaml", CacheFileConfig, "cache"),
-        ("runtime/agent.yaml", FilesystemFileConfig, "filesystem"),
-        ("runtime/agent.yaml", OpaFileConfig, "opa"),
-        ("runtime/agent.yaml", ExecutionConfig, "execution"),
-        ("runtime/observability.yaml", OtelFileConfig, None),
-        ("runtime/router.yaml", RouterConfig, None),
-        ("integrations/channels.yaml", ChannelsFileConfig, None),
+        ("agent", MiddlewareDefaults, "middleware"),
+        ("agent", ProvidersFileConfig, "providers"),
+        ("agent", CacheFileConfig, "cache"),
+        ("agent", FilesystemFileConfig, "filesystem"),
+        ("agent", OpaFileConfig, "opa"),
+        ("agent", ExecutionConfig, "execution"),
+        ("observability", OtelFileConfig, None),
+        ("router", RouterConfig, None),
+        ("channels", ChannelsFileConfig, None),
     ]
 
-    for rel, model, section in targets:
+    for name, model, section in targets:
+        rel = _first_present(config_dir, name)
+        if rel is None:
+            continue
         _validate_model(report, config_dir / rel, rel, model, section)
 
     _check_required_files(report, config_dir)
