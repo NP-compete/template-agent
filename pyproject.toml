@@ -19,7 +19,7 @@ readme = "README.md"
 keywords = ["mcp", "template", "server"]
 requires-python = ">=3.12.2"
 dependencies = [
-    "deepagents==0.7.24",
+    "deepagents==0.7.26",
     # Document parsing for attachments and the knowledge corpus. Without
     # these, extraction silently returns empty text and a PDF uploads
     # "successfully" with nothing indexed.
@@ -27,10 +27,10 @@ dependencies = [
     "python-docx==1.2.0",
     "openpyxl==3.1.5",
     "python-pptx==1.0.2",
-    "pydantic==2.14.1",
+    "pydantic==2.13.4",
     "pydantic-settings==2.15.0",
-    "python-dotenv==1.2.4",
-    "langchain-google-genai==4.4.1",
+    "python-dotenv==1.2.2",
+    "langchain-google-genai==4.4.2",
     "langchain-google-vertexai==3.2.4",
     "langchain-openai==1.7.1",
     "langchain-mcp-adapters==0.3.2",

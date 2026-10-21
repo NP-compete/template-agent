@@ -129,6 +129,7 @@ def _graph_fingerprint(
     mcp_names: list[str] | None = None,
     resource_uris: list[str] | None = None,
     user_identity: str = "",
+    location: str | None = None,
 ) -> str:
     """Stable fingerprint for graph cache keying.
 
@@ -143,7 +144,7 @@ def _graph_fingerprint(
         f",mode={hitl_mode}"
         f",exclude={','.join(sorted(hitl_exclude or []))}"
     )
-    model_flag = f"temp={temperature},max_tokens={max_tokens}"
+    model_flag = f"temp={temperature},max_tokens={max_tokens},location={location}"
     mcp_flag = ",".join(sorted(mcp_names or []))
     resources_flag = ",".join(sorted(resource_uris or []))
     raw = (
@@ -415,6 +416,7 @@ async def agent(runtime: ServerRuntime) -> Any:
     model_params = agent_config.get_model_params(orch_spec.name)
     orch_temperature = model_params.get("temperature", 0.0)
     orch_max_tokens = model_params.get("max_tokens") or None
+    orch_location = model_params.get("location")
 
     logger.info(
         "Building agent '%s' (model=%s, provider=%s, temp=%s, max_tokens=%s, mcp_auth=%s)",
@@ -430,6 +432,7 @@ async def agent(runtime: ServerRuntime) -> Any:
         orch_spec,
         temperature=float(orch_temperature),
         max_output_tokens=int(orch_max_tokens) if orch_max_tokens else None,
+        location=orch_location,
     )
 
     providers_config = agent_config.get_providers_config()
@@ -548,6 +551,7 @@ async def agent(runtime: ServerRuntime) -> Any:
         mcp_names=mcp_server_names or None,
         resource_uris=orchestrator_cfg.get("resources") or None,
         user_identity=str(user_identity or ""),
+        location=orch_location,
     )
     now = time.time()
     graph_ttl = float(agent_config.get_cache_config().graph.ttl)
