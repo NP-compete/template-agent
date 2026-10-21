@@ -35,7 +35,9 @@ logger = get_python_logger()
 
 _startup_complete = False
 # Strong references to background tasks; asyncio keeps only weak ones.
-_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+# `Any` rather than `Task[None]`: the sweeper returns None and the
+# warm-up returns a count, and both belong here.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 async def run_startup() -> dict[str, str]:
@@ -563,12 +565,21 @@ async def _warm_graph() -> str:
     and with the scale-to-zero component on *every* first request after
     an idle period, which is exactly when someone is watching.
 
-    The cache key is derived from resolved config, not from the caller,
-    so a build with no user populates the same entry the first real
-    request will look for. Users who have turned memory off resolve to a
-    second key and still pay once; warming the default covers the common
-    case.
+    The cache key includes the caller's identity, because the compiled
+    graph holds middleware built for one person. So warming with no
+    user populates an entry no real request looks for, and the first
+    request of every person still paid the full build. Worse, the
+    anonymous build is the *cheap* one: with no token there is nothing
+    to connect to, so it finished in milliseconds and looked like it
+    had done the job. A user with a connected integration pays ~10s
+    of MCP discovery, which is the cost worth moving off the critical
+    path.
+
+    So: the anonymous key first, then the key of every user who has a
+    stored MCP token. Those are exactly the people whose build is
+    slow, and they are already known at boot.
     """
+    warmed = 0
     try:
         from deep_agent.aegra.graph import agent
 
@@ -578,12 +589,94 @@ async def _warm_graph() -> str:
             user = None
 
         await agent(_NoUser())
-        return "graph warmed"
+        warmed += 1
     except Exception as exc:
         # Never fatal. A pod that cannot pre-build will still serve,
         # just with the old first-request cost.
         logger.warning("Graph warm-up skipped: %s", exc)
         return f"graph not warmed: {exc}"
+
+    # In the background, deliberately.
+    #
+    # Each connected user costs the ~10s of MCP discovery it saves
+    # them later, and awaiting that here put it on the readiness
+    # path: startup went from 7s to 67s, the pod failed its probe
+    # window and the rolling update timed out. The whole point is to
+    # move the cost off a path someone is waiting on, and readiness
+    # is one of those.
+    try:
+        task = asyncio.create_task(_warm_connected_users())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+    except RuntimeError:
+        logger.debug("No running loop for per-user graph warm-up")
+
+    return f"graph warmed ({warmed} key(s), users warming in background)"
+
+
+async def _warm_connected_users() -> int:
+    """Pre-build for each user who has an MCP token stored.
+
+    Bounded: a deployment with many users must not spend minutes of
+    boot warming all of them, and the ones left out are no worse off
+    than before this existed.
+    """
+    from deep_agent.aegra.graph import agent
+    from deep_agent.aegra.redis import get_redis_client, run_redis
+    from deep_agent.src.settings import settings as app_settings
+
+    limit = app_settings.GRAPH_WARM_MAX_USERS
+    if limit <= 0:
+        return 0
+
+    pattern = f"{app_settings.MCP_TOKEN_KEY_PREFIX}{app_settings.agent_deployment_id}:*"
+
+    def _scan() -> list[str]:
+        client = get_redis_client()
+        if client is None:
+            return []
+        return [
+            key.decode() if isinstance(key, bytes) else str(key)
+            for key in client.scan_iter(match=f"*{pattern}", count=200)
+        ]
+
+    keys = await run_redis(_scan)
+    users: list[str] = []
+    for key in keys:
+        # ...<prefix><agent>:<user>:<mcp>, and a user id can itself
+        # contain a colon, so take the middle by position from the
+        # right rather than splitting from the left.
+        parts = key.split(":")
+        if len(parts) < 3:
+            continue
+        user_id = parts[-2]
+        if user_id and user_id not in users:
+            users.append(user_id)
+        if len(users) >= limit:
+            break
+
+    if not users:
+        return 0
+
+    class _User:
+        def __init__(self, identity: str) -> None:
+            self.identity = identity
+            self.access_token = None
+            self.refresh_token = None
+
+    class _Runtime:
+        def __init__(self, identity: str) -> None:
+            self.user = _User(identity)
+
+    warmed = 0
+    for user_id in users:
+        try:
+            await agent(_Runtime(user_id))
+            warmed += 1
+        except Exception:
+            logger.debug("Could not warm graph for a user", exc_info=True)
+    logger.info("Pre-built the graph for %d connected user(s)", warmed)
+    return warmed
 
 
 def _setup_otel() -> str:

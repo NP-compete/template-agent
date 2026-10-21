@@ -476,6 +476,10 @@ class Settings(BaseSettings):
     # ── Namespaces and internal identifiers ───────────────────────────────
     MCP_SHARED_BREAKER_KEY: str = Field(default="mcp-servers")
     MCP_TOKEN_KEY_PREFIX: str = Field(default="mcp_oauth_token:")
+    # How many connected users to pre-build the graph for at boot.
+    # Each costs the MCP discovery it saves that user later, so this
+    # trades startup time for first-request time.
+    GRAPH_WARM_MAX_USERS: int = Field(default=5, ge=0)
     CIRCUIT_BREAKER_KEY_PREFIX: str = Field(default="aegra:circuit:")
     PERSONALIZATION_KEY_PREFIX: str = Field(default="personalization:")
     STOCK_MEMORY_NAMESPACE: str = Field(default="memories")

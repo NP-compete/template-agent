@@ -1,5 +1,6 @@
 """Unit tests for startup orchestrator."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -349,19 +350,60 @@ class TestWarmGraph:
             "sys.modules",
             {"deep_agent.aegra.graph": MagicMock(agent=agent)},
         ):
-            assert await startup._warm_graph() == "graph warmed"
+            assert (await startup._warm_graph()).startswith("graph warmed")
         agent.assert_awaited_once()
 
-    async def test_builds_with_no_user_so_the_cache_key_is_the_shared_one(self):
-        # The factory skips MCP when user is None, and the entry it
-        # populates is the one the first real request looks for.
+    async def test_builds_the_anonymous_key_first(self):
+        # Still warmed: an unauthenticated caller resolves to it, and
+        # the factory skips MCP when user is None.
         agent = AsyncMock()
         with patch.dict(
             "sys.modules", {"deep_agent.aegra.graph": MagicMock(agent=agent)}
         ):
             await startup._warm_graph()
-        runtime = agent.await_args.args[0]
+        runtime = agent.await_args_list[0].args[0]
         assert runtime.user is None
+
+    async def test_also_warms_the_keys_real_requests_use(self):
+        """The cache key carries the caller, so the anonymous one is not enough.
+
+        Warming only the no-user key left every person paying the
+        full build on their first turn. It also looked fine in the
+        logs: with no token there is nothing to connect to, so the
+        anonymous build finishes in milliseconds. The slow build is
+        the one for someone with a connected integration.
+        """
+        agent = AsyncMock()
+        with (
+            patch.dict(
+                "sys.modules", {"deep_agent.aegra.graph": MagicMock(agent=agent)}
+            ),
+            patch.object(
+                startup,
+                "_warm_connected_users",
+                AsyncMock(return_value=2),
+            ) as warm_users,
+        ):
+            result = await startup._warm_graph()
+        # Scheduled, not awaited: see the comment in `_warm_graph`.
+        await asyncio.sleep(0)
+        warm_users.assert_awaited_once()
+        assert "background" in result
+
+    async def test_a_user_warmup_failure_does_not_fail_startup(self):
+        agent = AsyncMock()
+        with (
+            patch.dict(
+                "sys.modules", {"deep_agent.aegra.graph": MagicMock(agent=agent)}
+            ),
+            patch.object(
+                startup,
+                "_warm_connected_users",
+                AsyncMock(side_effect=RuntimeError("redis down")),
+            ),
+        ):
+            result = await startup._warm_graph()
+        assert result.startswith("graph warmed")
 
     async def test_a_failed_warmup_is_reported_not_raised(self):
         agent = AsyncMock(side_effect=RuntimeError("no credentials"))
